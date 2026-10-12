@@ -1,0 +1,23 @@
+{
+   "PKG_DESC": {
+      "message": "Trancy proporciona subtítulos bilingües para plataformas como YouTube, Disney+,TED, Edx, Kehan, Coursera... así como traductor de IA para sitios web."
+   },
+   "PKG_NAME": {
+      "message": "Trancy - Traductor AI & Subtítulos bilingües"
+   },
+   "aiTranscribe": {
+      "message": "Transcripción de IA de Youtube_Trancy"
+   },
+   "captionToggle": {
+      "message": "Subtítulos bilingües_Trancy"
+   },
+   "quickTranslator": {
+      "message": "Traductor rápido_Trancy"
+   },
+   "toggleFulltextImmersive": {
+      "message": "Traducción inmersiva_Trancy"
+   },
+   "toggleVideoImmersive": {
+      "message": "Modo de aprendizaje de video_Trancy"
+   }
+}

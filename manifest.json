@@ -1,0 +1,78 @@
+{
+   "action": {
+      "default_title": "Trancy"
+   },
+   "background": {
+      "service_worker": "assets/background.js"
+   },
+   "commands": {
+      "ai-transcribe": {
+         "description": "__MSG_aiTranscribe__"
+      },
+      "caption-toggle": {
+         "description": "__MSG_captionToggle__",
+         "suggested_key": {
+            "default": "Alt+C",
+            "mac": "Alt+C"
+         }
+      },
+      "fulltext-translate": {
+         "description": "__MSG_toggleFulltextImmersive__",
+         "suggested_key": {
+            "default": "Alt+E",
+            "mac": "Alt+E"
+         }
+      },
+      "quick-translator": {
+         "description": "__MSG_quickTranslator__",
+         "suggested_key": {
+            "default": "Alt+D",
+            "mac": "Alt+D"
+         }
+      },
+      "toggle": {
+         "description": "__MSG_toggleVideoImmersive__",
+         "suggested_key": {
+            "default": "Ctrl+E",
+            "mac": "Command+E"
+         }
+      }
+   },
+   "content_scripts": [ {
+      "all_frames": true,
+      "css": [ "assets/edvideo.css" ],
+      "js": [ "assets/edvideo-onload.js" ],
+      "matches": [ "https://youtube.com/*", "https://m.youtube.com/*", "https://www.youtube.com/*", "https://netflix.com/*", "https://www.netflix.com/*", "https://www.coursera.org/*", "https://coursera.org/*", "https://www.udemy.com/*", "https://udemy.com/*", "https://*.udemy.cn/*", "https://*.udemy.com/*", "https://*.ted.com/*", "https://*.youtube-nocookie.com/*", "https://*.hbomax.com/*", "https://*.max.com/*", "https://*.disneyplus.com/*", "https://*.edx.org/*", "https://*.primevideo.com/*", "https://*.deeplearning.ai/*", "https://*.bilibili.com/*", "https://vimeo.com/*", "https://*.vimeo.com/*" ],
+      "run_at": "document_start"
+   }, {
+      "all_frames": true,
+      "js": [ "assets/tagger-main.js", "assets/ld-main.js", "assets/edreader-main.js" ],
+      "matches": [ "http://*/*", "https://*/*", "file://*/*" ],
+      "run_at": "document_start"
+   } ],
+   "default_locale": "en",
+   "description": "__MSG_PKG_DESC__",
+   "externally_connectable": {
+      "matches": [ "*://localhost/*" ]
+   },
+   "host_permissions": [ "\u003Call_urls>" ],
+   "icons": {
+      "128": "assets/icons/ic128.png",
+      "16": "assets/icons/ic16.png",
+      "256": "assets/icons/ic256.png",
+      "32": "assets/icons/ic32.png",
+      "48": "assets/icons/ic48.png",
+      "512": "assets/icons/ic512.png",
+      "96": "assets/icons/ic96.png"
+   },
+   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEApsZDNlPHcZCrwXDZY4XJkwF0DHR7TCTahUYQ8PUbF+KycXn1f+zjvAm9Cs0RHo5A8z7wMgN7QnuPgILtGHMmaJ4TdC4GC0WEgFmSlzo23Yb0OiEdHQK3J9i4qbQLfz73uEldhLlssF/yZpcvzymj6NhTmSkkcSDhtzSNbGU9Kkn9fmX4W2Uqsp5ZUvYadpxf/ZQJ5MwezkVZad1Ocfr+wq2dJYaEXkgfMoaO2YADkvFCBm9qd9jgU7KZh6UWmyIz/cYx0HZEXhl4REUx8J/1Tnxf/0T+wxX7KQqZwPS1hN8nGXIMuaudG8ODyzKdqlAB74J9oMx/M5Fz3/eFrL0MoQIDAQAB",
+   "manifest_version": 3,
+   "name": "__MSG_PKG_NAME__",
+   "permissions": [ "storage", "contextMenus", "unlimitedStorage" ],
+   "update_url": "https://clients2.google.com/service/update2/crx",
+   "version": "7.9.4",
+   "web_accessible_resources": [ {
+      "matches": [ "http://*/*", "https://*/*", "file:///*" ],
+      "resources": [ "assets/*" ]
+   } ]
+}

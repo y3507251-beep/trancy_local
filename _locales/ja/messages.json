@@ -1,0 +1,23 @@
+{
+   "PKG_DESC": {
+      "message": "Trancy は YouTube、Udemy、Disney+、TED、edX、Kehan、Coursera などのプラットフォームに対するバイリンガル字幕のサポートだけでなく、一般的なウェブページの AI ワード/フレーズ翻訳、全文浸漬翻訳などの機能も提供し、本当の言語学習のオールインワンアシスタントです。"
+   },
+   "PKG_NAME": {
+      "message": "Trancy - AI翻訳 & 二重字幕"
+   },
+   "aiTranscribe": {
+      "message": "Youtube 字幕変換_Trancy"
+   },
+   "captionToggle": {
+      "message": "バイリンガル字幕_Trancy"
+   },
+   "quickTranslator": {
+      "message": "クイック翻訳_Trancy"
+   },
+   "toggleFulltextImmersive": {
+      "message": "全文浸漬翻訳_Trancy"
+   },
+   "toggleVideoImmersive": {
+      "message": "ビデオ学習モード_Trancy"
+   }
+}

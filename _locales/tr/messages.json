@@ -1,0 +1,23 @@
+{
+   "PKG_DESC": {
+      "message": "Trancy, YouTube, Disney+, TED, edX, Kehan, Coursera gibi platformlar için çift dilli altyazı sağlar ve aynı zamanda web siteleri için yapay zeka çevirmeni sunar."
+   },
+   "PKG_NAME": {
+      "message": "Trancy - Yapay Zekâ Çevirmen & Çift Dilli Altyazılar"
+   },
+   "aiTranscribe": {
+      "message": "Youtube AI Altyazıları_Trancy"
+   },
+   "captionToggle": {
+      "message": "Çift dilli altyazılar_Trancy"
+   },
+   "quickTranslator": {
+      "message": "Hızlı çeviri_Trancy"
+   },
+   "toggleFulltextImmersive": {
+      "message": "Tam sayfa çeviri_Trancy"
+   },
+   "toggleVideoImmersive": {
+      "message": "Video öğrenme modu_Trancy"
+   }
+}

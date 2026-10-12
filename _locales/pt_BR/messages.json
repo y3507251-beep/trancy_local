@@ -1,0 +1,23 @@
+{
+   "PKG_DESC": {
+      "message": "O Trancy fornece legendas bilíngues para plataformas como YouTube, Disney+, TED, edX, Kehan, Coursera... além de tradução de IA para sites."
+   },
+   "PKG_NAME": {
+      "message": "Trancy - Tradutor de IA & Legendas bilíngues"
+   },
+   "aiTranscribe": {
+      "message": "Legendas de IA de Youtube_Trancy"
+   },
+   "captionToggle": {
+      "message": "Legendas bilíngues_Trancy"
+   },
+   "quickTranslator": {
+      "message": "Tradução rápida_Trancy"
+   },
+   "toggleFulltextImmersive": {
+      "message": "Tradução imersiva_Trancy"
+   },
+   "toggleVideoImmersive": {
+      "message": "Modo de aprendizagem de vídeo_Trancy"
+   }
+}

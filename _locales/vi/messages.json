@@ -1,0 +1,23 @@
+{
+   "PKG_DESC": {
+      "message": "Trancy cung cấp phụ đề song ngữ cho các nền tảng như YouTube, Disney+, TED, edX, Kehan, Coursera... cũng như dịch thuật trang web bằng trí tuệ nhân tạo."
+   },
+   "PKG_NAME": {
+      "message": "Trancy - Trình dịch AI & Phụ đề song ngữ"
+   },
+   "aiTranscribe": {
+      "message": "Youtube AI Phụ đề_Trancy"
+   },
+   "captionToggle": {
+      "message": "Phụ đề song ngữ_Trancy"
+   },
+   "quickTranslator": {
+      "message": "Dịch thuận_Trancy"
+   },
+   "toggleFulltextImmersive": {
+      "message": "Dịch thuật tận hưởng_Trancy"
+   },
+   "toggleVideoImmersive": {
+      "message": "Video học_Trancy"
+   }
+}

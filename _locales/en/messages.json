@@ -1,0 +1,23 @@
+{
+   "PKG_DESC": {
+      "message": "Trancy provides bilingual subtitle for platforms like YouTube, Disney+, as well as AI translator for websites."
+   },
+   "PKG_NAME": {
+      "message": "Trancy - AI Translator & Dual Subtitles"
+   },
+   "aiTranscribe": {
+      "message": "Youtube AI Transcription_Trancy"
+   },
+   "captionToggle": {
+      "message": "Bilingual Subtitles_Trancy"
+   },
+   "quickTranslator": {
+      "message": "Quick Translator_Trancy"
+   },
+   "toggleFulltextImmersive": {
+      "message": "Immersive Translate_Trancy"
+   },
+   "toggleVideoImmersive": {
+      "message": "Video Learning Mode_Trancy"
+   }
+}

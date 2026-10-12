@@ -1,0 +1,23 @@
+{
+   "PKG_DESC": {
+      "message": "Trancy ให้บริการคำบรรยายสองภาษาสำหรับแพลตฟอร์มเช่น YouTube, Disney+ รวมถึงเครื่องแปลภาษา AI สำหรับเว็บไซต์"
+   },
+   "PKG_NAME": {
+      "message": "Trancy - ผู้แปล AI & คำบรรยายสองภาษา"
+   },
+   "aiTranscribe": {
+      "message": "การถอดเสียงด้วย AI ของ Youtube_Trancy"
+   },
+   "captionToggle": {
+      "message": "คำบรรยายสองภาษา_Trancy"
+   },
+   "quickTranslator": {
+      "message": "เครื่องแปลอย่างรวดเร็ว_Trancy"
+   },
+   "toggleFulltextImmersive": {
+      "message": "การแปลแบบดื่มด่ำ_Trancy"
+   },
+   "toggleVideoImmersive": {
+      "message": "โหมดการเรียนรู้วิดีโอ_Trancy"
+   }
+}

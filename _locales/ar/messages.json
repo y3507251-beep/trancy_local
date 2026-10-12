@@ -1,0 +1,23 @@
+{
+   "PKG_DESC": {
+      "message": "ترانسي يوفر ترجمة ثنائية اللغة لمنصات مثل يوتيوب وديزني بلس وتيد وإيديكس وكورسيرا... بالإضافة إلى مترجم ذكي للمواقع."
+   },
+   "PKG_NAME": {
+      "message": "Trancy - مترجم بالذكاء الاصطناعي وترجمة مزدوجة"
+   },
+   "aiTranscribe": {
+      "message": "تفعيل/تعطيل ترجمة الفيديو باللغة العربية [Trancy]"
+   },
+   "captionToggle": {
+      "message": "تفعيل/تعطيل الترجمة المتعددة اللغات [Trancy]"
+   },
+   "quickTranslator": {
+      "message": "تفعيل/تعطيل الترجمة السريعة [Trancy]"
+   },
+   "toggleFulltextImmersive": {
+      "message": "تفعيل/تعطيل الترجمة المغمورة [Trancy]"
+   },
+   "toggleVideoImmersive": {
+      "message": "تفعيل/تعطيل وضع التعلم بالفيديو [Trancy]"
+   }
+}

@@ -1,0 +1,23 @@
+{
+   "PKG_DESC": {
+      "message": "Trancy 不僅提供對 YouTube, Udemy, Disney+, TED, edX, Kehan, Coursera 等平台的雙語字幕支援，還能實現對普通網頁的 AI 劃詞/劃句翻譯、全文沉浸翻譯等功能，真正的語言學習全能助手。"
+   },
+   "PKG_NAME": {
+      "message": "Trancy - AI 翻譯 & 雙語字幕"
+   },
+   "aiTranscribe": {
+      "message": "Youtube 字幕轉寫_Trancy"
+   },
+   "captionToggle": {
+      "message": "雙語字幕_Trancy"
+   },
+   "quickTranslator": {
+      "message": "快捷翻譯_Trancy"
+   },
+   "toggleFulltextImmersive": {
+      "message": "沉浸式翻譯_Trancy"
+   },
+   "toggleVideoImmersive": {
+      "message": "視頻學習模式_Trancy"
+   }
+}

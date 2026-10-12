@@ -1,0 +1,23 @@
+{
+   "PKG_DESC": {
+      "message": "Trancy زیرنویس دوزبانه برای پلتفرم‌هایی مانند YouTube، Disney+ و همچنین مترجم هوش مصنوعی برای وب‌سایت‌ها ارائه می‌دهد."
+   },
+   "PKG_NAME": {
+      "message": "Trancy - مترجم هوش مصنوعی و زیرنویس دو زبانه"
+   },
+   "aiTranscribe": {
+      "message": "رونویسی هوش مصنوعی یوتیوب_Trancy"
+   },
+   "captionToggle": {
+      "message": "زیرنویس دوزبانه_Trancy"
+   },
+   "quickTranslator": {
+      "message": "مترجم سریع_Trancy"
+   },
+   "toggleFulltextImmersive": {
+      "message": "ترجمه فراگیر_Trancy"
+   },
+   "toggleVideoImmersive": {
+      "message": "حالت یادگیری ویدیو_Trancy"
+   }
+}

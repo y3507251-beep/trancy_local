@@ -1,0 +1,23 @@
+{
+   "PKG_DESC": {
+      "message": "Trancy предоставляет двуязычные субтитры для платформ, таких как YouTube, Disney+, TED, edX, Kehan, Coursera... а также ИИ-переводчик для веб-сайтов."
+   },
+   "PKG_NAME": {
+      "message": "Trancy - ИИ переводчик и двуязычные субтитры"
+   },
+   "aiTranscribe": {
+      "message": "Youtube AI Субтитры_Trancy"
+   },
+   "captionToggle": {
+      "message": "Двуязычные субтитры_Trancy"
+   },
+   "quickTranslator": {
+      "message": "Быстрый перевод_Trancy"
+   },
+   "toggleFulltextImmersive": {
+      "message": "Погружной перевод_Trancy"
+   },
+   "toggleVideoImmersive": {
+      "message": "Режим обучения видео_Trancy"
+   }
+}

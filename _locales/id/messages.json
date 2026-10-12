@@ -1,0 +1,23 @@
+{
+   "PKG_DESC": {
+      "message": "Trancy menyediakan subtitle bilingual untuk platform seperti YouTube, Disney+, serta penerjemah AI untuk situs web."
+   },
+   "PKG_NAME": {
+      "message": "Trancy - Penerjemah AI & Subtitle bilingual"
+   },
+   "aiTranscribe": {
+      "message": "Transkripsi AI Youtube_Trancy"
+   },
+   "captionToggle": {
+      "message": "Subtitle Bilingual_Trancy"
+   },
+   "quickTranslator": {
+      "message": "Penerjemah Cepat_Trancy"
+   },
+   "toggleFulltextImmersive": {
+      "message": "Terjemahan Imersif_Trancy"
+   },
+   "toggleVideoImmersive": {
+      "message": "Mode Pembelajaran Video_Trancy"
+   }
+}
