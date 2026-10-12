@@ -24,12 +24,10 @@ from .translation import TranslationError
 
 
 def extension_id() -> str:
-    try:
-        manifest = json.loads((Path(__file__).resolve().parents[2] / "manifest.json").read_text("utf-8"))
-        digest = hashlib.sha256(base64.b64decode(manifest["key"])).hexdigest()[:32]
-        return "".join(chr(97 + int(c, 16)) for c in digest)
-    except (OSError, ValueError, KeyError):
-        return "mjdbhokoopacimoekfgkcoogikbfgngb"
+    manifest_path = Path(__file__).resolve().parents[1] / "browser-extension" / "manifest.json"
+    manifest = json.loads(manifest_path.read_text("utf-8"))
+    digest = hashlib.sha256(base64.b64decode(manifest["key"], validate=True)).hexdigest()[:32]
+    return "".join(chr(97 + int(c, 16)) for c in digest)
 
 
 def media_url_allowed(url: str, platform: str, cid: str = "") -> bool:

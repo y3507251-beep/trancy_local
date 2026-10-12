@@ -72,16 +72,16 @@ py -3.13 -m venv .venv
 
 ## B 站与 YouTube
 
-网页模式需要**包含本次桌面桥代码的扩展副本**，仅安装原商店版还不会向桌面发送播放状态。
+网页模式需要独立的 **Trancy 桌面字幕连接器** 扩展。它与原 Trancy 使用不同 ID，可以同时安装；网页端只注入桌面连接脚本，避免两个扩展同时绘制网页字幕浮层。
 
 当前仓库根目录保留了打包插件的 `_metadata` 快照。请从独立的开发运行副本加载扩展，副本仅需要 `manifest.json`、`assets/`、`_locales/`、`index.html` 和 `popup.html`。不把根目录的 `_metadata`、`.git`、`desktop` 复制进去，也不删除原快照。Chromium 的元数据清理代码会删除保留的哈希文件，因此不应把原始快照目录直接作为加载测试目录。[Chromium 源码](https://chromium.googlesource.com/chromium/src/+/HEAD/extensions/common/file_util.cc#700)
 
-双击 [生成浏览器扩展.cmd](生成浏览器扩展.cmd)，运行 [tools/prepare_extension.py](tools/prepare_extension.py) 生成 `desktop/data/unpacked-extension`。当前已生成这个运行副本。每次更新先准备完整的新副本，成功后将旧运行副本移入回收站，再切换到新副本；原始 `_metadata` 保留。
+双击 [生成浏览器扩展.cmd](生成浏览器扩展.cmd)，运行 [tools/prepare_extension.py](tools/prepare_extension.py) 生成 `desktop/data/desktop-connector`。每次更新先准备完整的新副本，成功后将旧连接器运行副本移入回收站，再切换到新副本；原始 `_metadata` 和以前的 `unpacked-extension` 副本保留。
 
-生成过程保留 `manifest.json` 的 `key`，扩展 ID 仍为 `mjdbhokoopacimoekfgkcoogikbfgngb`，桌面桥只接受这个扩展身份。
+连接器的独立 manifest 保存在 [browser-extension/manifest.json](browser-extension/manifest.json)，名称为 **Trancy 桌面字幕连接器**，固定 ID 为 `phkekicmpkiinghhklcoanjjdnccdeod`。每次重新生成副本都保留这个新 ID，桌面桥只接受它。原 Trancy 的 ID `mjdbhokoopacimoekfgkcoogikbfgngb` 不参与桌面任务。
 
-1. 启动桌面软件。
-2. 在 Chrome 的 `chrome://extensions/` 打开开发者模式，通过“加载已解压的扩展程序”选择上述运行副本。
+1. 启动桌面软件。由以前同 ID 的版本切换到独立连接器时，先关闭并重新启动桌面软件，以使用新的扩展身份校验。
+2. 在 Chrome 的 `chrome://extensions/` 打开开发者模式，通过“加载已解压的扩展程序”选择 `desktop/data/desktop-connector`。列表中会显示独立的“Trancy 桌面字幕连接器”卡片。
 3. 后续代码更新后重新运行“生成浏览器扩展.cmd”，在扩展管理页点击“重新加载”，并刷新已经打开的视频网页。
 4. 打开 B 站 BV 视频页面或 YouTube 视频页面，开始播放以准备当前视频元数据。
 5. 在桌面软件“B 站 / YouTube”中选择对应视频，点击“生成所选网页视频双语字幕”。
@@ -106,7 +106,7 @@ py -3.13 -m venv .venv
 | Google · 插件内置引擎 | 使用当前插件内置 Google 实现相同的 `translate_a/t` 地址、表单批量请求、空白规范化和实体解码 | 不需要；需要网络访问翻译服务 |
 | 浏览器插件当前引擎 | 请求扩展读取 `state.translatorService.subtitle`，调用插件已有的 `Cl.translate` 调度器 | 需要浏览器中已加载更新后的插件并与桌面连接 |
 
-Google 模式是桌面的默认选项。插件模式跟随扩展当前选中的字幕翻译引擎，包括它已有的模型和鉴权配置。账号 token 和供应商 API key 只在扩展后台读取并交给现有翻译器，桌面软件不接收或保存这些凭据。插件模式切换引擎后重新生成即可使用新配置。
+Google 模式是桌面的默认选项。插件模式跟随连接器扩展当前选中的字幕翻译引擎，包括它已有的模型和鉴权配置。新 ID 拥有独立的浏览器扩展设置；原 Trancy 的账号或翻译配置不会自动转移，插件模式需要在连接器的设置界面中配置，Google 模式无需迁移账号。账号 token 和供应商 API key 只在扩展后台读取并交给现有翻译器，桌面软件不接收或保存这些凭据。
 
 中英翻译方向根据识别语言和原文文字判断。模型返回中文时产生英文译文；返回英文时产生中文译文，字幕浮层显示原文与译文两行。
 
@@ -134,7 +134,7 @@ Google 模式是桌面的默认选项。插件模式跟随扩展当前选中的�
 - 两次都只操作专用测试播放器实例，没有录制系统声音；退出时自有识别进程和测试播放器正常关闭。
 - 已检查中英长句浮层及设置窗口的实际渲染。对应本机证据保存在 `desktop/data/validation/`，未上传测试媒体。
 
-控制器、环回分段逻辑、识别进程、翻译桥、播放器协议和浮层的 **60 项自动化回归全部通过**。Large v3、Qwen3-ASR 和所有视频容器格式尚未逐一实测。
+控制器、环回分段逻辑、识别进程、翻译桥、播放器协议和浮层的 **63 项自动化回归全部通过**，包括新旧扩展身份隔离。Large v3、Qwen3-ASR 和所有视频容器格式尚未逐一实测。
 
 2026-10-13 已完成的浏览器／翻译专项检查记录在 [tests/browser_verification.json](tests/browser_verification.json)：
 

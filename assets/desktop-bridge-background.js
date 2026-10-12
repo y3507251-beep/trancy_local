@@ -131,6 +131,9 @@
   self.TrancyDesktopBridge = {
     start(dependencies) {
       if (api) return;
+      // The connector has its own identity. The original Trancy installation
+      // must not compete for desktop jobs or log connection failures.
+      if (chrome.runtime.getManifest().name !== "Trancy 桌面字幕连接器") return;
       api = dependencies;
       chrome.runtime.onMessage.addListener((message, sender) => {
         if (message?.kind !== "trancy-desktop-report-v1" || sender.id !== chrome.runtime.id ||

@@ -26,6 +26,15 @@ VIDEO = {"url": "https://www.bilibili.com/video/BV1xx411c7mD/?p=2", "platform": 
 
 
 class VideoIdentityTests(unittest.TestCase):
+    def test_connector_identity_is_stable_and_distinct_from_original(self):
+        self.assertEqual(extension_id(), "phkekicmpkiinghhklcoanjjdnccdeod")
+        self.assertNotEqual(extension_id(), "mjdbhokoopacimoekfgkcoogikbfgngb")
+        root = Path(__file__).resolve().parents[1]
+        manifest = json.loads((root / "browser-extension" / "manifest.json").read_text("utf-8"))
+        self.assertEqual(manifest["name"], "Trancy 桌面字幕连接器")
+        scripts = [p for entry in manifest["content_scripts"] for p in entry.get("js", [])]
+        self.assertEqual(scripts, ["assets/desktop-bridge-page.js", "assets/desktop-bridge-content.js"])
+
     def test_bili_part_cid_and_media_are_bound(self):
         result = normalize_video(VIDEO)
         self.assertEqual(result["key"], "bilibili:BV1xx411c7mD:2:12345")
@@ -113,6 +122,14 @@ class BridgeTests(unittest.TestCase):
             self.post("/download", {"url": "http://127.0.0.1/private", "path": "c:/secret"})
         self.assertEqual(raised.exception.code, 404)
 
+    def test_original_extension_identity_cannot_take_connector_jobs(self):
+        legacy = "mjdbhokoopacimoekfgkcoogikbfgngb"
+        headers = dict(self.headers, Origin="chrome-extension://" + legacy,
+                       **{"X-Trancy-Extension": legacy})
+        with self.assertRaises(HTTPError) as raised:
+            self.post("/v1/poll", {}, headers)
+        self.assertEqual(raised.exception.code, 403)
+
     def test_tabs_sequences_and_closed_video(self):
         self.post("/v1/video", {"tab_id": 10, "seq": 2, "video": VIDEO})
         result = self.post("/v1/video", {"tab_id": 10, "seq": 1, "video": dict(VIDEO, position=1)})
@@ -161,6 +178,24 @@ class BridgeTests(unittest.TestCase):
 
 
 class ExtensionBridgeTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("node"), "Node.js is required for the extension sandbox test")
+    def test_original_trancy_background_does_not_connect_to_desktop(self):
+        script = r'''
+const assert=require('node:assert/strict'), fs=require('node:fs'), vm=require('node:vm');
+let requests=0;
+const context={URL,AbortSignal,crypto:require('node:crypto').webcrypto,
+  chrome:{runtime:{getManifest:()=>({name:'Trancy - AI 翻译 & 双语字幕'})}},
+  fetch:()=>{requests++;throw new Error('legacy must not connect');}};
+context.self=context;vm.createContext(context);
+vm.runInContext(fs.readFileSync('assets/desktop-bridge-background.js','utf8'),context);
+context.TrancyDesktopBridge.start({getState:()=>{throw new Error('unused');}});
+assert.equal(requests,0);
+'''
+        result = subprocess.run([shutil.which("node"), "-e", script],
+                                cwd=Path(__file__).resolve().parents[2], capture_output=True,
+                                text=True, encoding="utf-8", timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     @unittest.skipUnless(shutil.which("node"), "Node.js is required for the extension sandbox test")
     def test_main_observer_rejects_stale_player_and_part_audio(self):
         script = r'''
@@ -221,7 +256,7 @@ const vm = require('node:vm');
   const selectedEngine = {_id:'user-selected-engine',type:'custom',key:'private-provider-key'};
   const context = {URL, AbortSignal, crypto:require('node:crypto').webcrypto,
     setTimeout: fn => {timer=fn;return 1;}, clearTimeout:()=>{},
-    chrome:{runtime:{id:'extension-test',getPlatformInfo:async()=>({}),onMessage:{addListener:fn=>listener=fn}},
+    chrome:{runtime:{id:'extension-test',getManifest:()=>({name:'Trancy 桌面字幕连接器'}),getPlatformInfo:async()=>({}),onMessage:{addListener:fn=>listener=fn}},
       tabs:{onRemoved:{addListener:()=>{}},onUpdated:{addListener:()=>{}}},
       alarms:{create:()=>{},onAlarm:{addListener:()=>{}}}},
     fetch:async (url, options)=>{

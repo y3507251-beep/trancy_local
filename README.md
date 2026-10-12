@@ -10,6 +10,8 @@ Chrome Manifest V3 扩展，提供 AI 翻译、双语字幕及语言学习功能
 
 桌面端复用 `D:\dev\SubtitleService` 的本地识别模型，翻译沿用插件的 Google 实现或通过浏览器桥接调用插件当前字幕引擎。桌面端生成字幕不要求原视频已有字幕。下文关于 `api.trancy.org` 的说明仍指原扩展的云端转录流程。
 
+网页连接使用独立的 **Trancy 桌面字幕连接器**，ID 为 `phkekicmpkiinghhklcoanjjdnccdeod`，运行目录为 `desktop/data/desktop-connector`，可以与原 Trancy 同时安装。
+
 当前电脑可双击 [启动桌面字幕.vbs](desktop/启动桌面字幕.vbs)。安装、浏览器扩展运行副本与验证情况见 [桌面使用说明](desktop/README.md)。
 
 ## 1. 文档依据与适用范围
