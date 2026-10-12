@@ -96,15 +96,61 @@ def normalize_video(raw: dict) -> dict:
              "paused": bool(raw.get("paused", True)), "rate": finite("rate", 1, .1, 16),
              "active": bool(raw.get("active", False)), "ad_playing": bool(raw.get("ad_playing", False)),
              "is_live": bool(raw.get("is_live", False)),
+             "document_start": finite("document_start", 0, 0, 1e16),
              "audio_urls": audio}
     if platform == "bilibili":
         video["bvid"] = video_id
     return video
 
 
+def normalize_caption_cues(raw: list, language: str = "") -> list[dict]:
+    """Keep only text/timing metadata; website URLs and credentials never enter cues."""
+    if not isinstance(raw, list) or not raw or len(raw) > 20000:
+        raise ValueError("invalid website captions")
+    result = []
+    for item in raw:
+        if not isinstance(item, dict):
+            raise ValueError("invalid website cue")
+        start, end = float(item["start"]), float(item["end"])
+        text = item.get("text")
+        if (not math.isfinite(start) or not math.isfinite(end) or not 0 <= start < end <= 604800 or
+                not isinstance(text, str) or not text.strip() or len(text) > 16000):
+            raise ValueError("invalid website cue")
+        cue = {"start": start, "end": end, "text": text.strip(),
+               "source_language": str(item.get("source_language", language))[:32],
+               "subtitle_kind": "asr" if item.get("subtitle_kind") == "asr" else "human"}
+        translation = item.get("translation", "")
+        if not isinstance(translation, str) or len(translation) > 16000:
+            raise ValueError("invalid website translation")
+        if translation.strip():
+            cue.update(translation=translation.strip(), target_language=str(item.get("target_language", ""))[:32],
+                       translation_source="platform")
+        words = item.get("words", [])
+        if not isinstance(words, list) or len(words) > 1000:
+            raise ValueError("invalid website word timings")
+        valid_words = []
+        for word in words:
+            try:
+                ws, we = float(word["start"]), float(word["end"])
+                token = word["text"]
+                if (isinstance(token, str) and token.strip() and len(token) <= 500 and
+                        math.isfinite(ws) and math.isfinite(we) and start <= ws < we <= end):
+                    valid_words.append({"text": token, "start": ws, "end": we})
+            except (KeyError, TypeError, ValueError):
+                continue
+        if valid_words:
+            cue["words"] = valid_words
+            cue["timing_source"] = "youtube"
+        else:
+            cue["timing_source"] = "cue"
+        result.append(cue)
+    return sorted(result, key=lambda c: (c["start"], c["end"]))
+
+
 class BrowserBridge(QObject):
     video_changed = pyqtSignal(dict)
     status_changed = pyqtSignal(str)
+    captions_ready = pyqtSignal(dict)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -115,6 +161,7 @@ class BrowserBridge(QObject):
         self._videos = {}
         self._sequences = {}
         self._jobs = {}
+        self._caption_jobs = {}
         self._extension_id = extension_id()
 
     def start(self, port: int = 18766):
@@ -166,6 +213,17 @@ class BrowserBridge(QObject):
 
             def do_POST(self):
                 if not self._headers_valid():
+                    # Windows can reset a connection closed with an unread
+                    # request body before the client receives the intended 403.
+                    # Drain only a bounded body; the same origin/session policy
+                    # still rejects it before any endpoint is dispatched.
+                    try:
+                        size = int(self.headers.get("Content-Length", "0"))
+                        if 0 < size <= 393216:
+                            self.connection.settimeout(1)
+                            self.rfile.read(size)
+                    except (ValueError, OSError):
+                        pass
                     self._respond(403, {"error": "extension origin rejected"})
                     return
                 try:
@@ -203,6 +261,9 @@ class BrowserBridge(QObject):
             for job in self._jobs.values():
                 job["error"] = "浏览器桥已关闭"
                 job["done"].set()
+            for job in self._caption_jobs.values():
+                job["timer"].cancel()
+            self._caption_jobs.clear()
             self._clients.clear()
             self._videos.clear()
             self._sequences.clear()
@@ -234,7 +295,19 @@ class BrowserBridge(QObject):
                         pending.append({"id": job_id, "texts": job["texts"], "source": job["source"], "target": job["target"]})
                         if len(pending) == 4:
                             break
-                return 200, {"jobs": pending}
+                captions = []
+                for job_id, job in self._caption_jobs.items():
+                    if job["client"] == client_id and not job["sent"] and job["deadline"] > now:
+                        job["sent"] = True
+                        captions.append({"id": job_id, "tab_id": job["video"]["tab_id"],
+                                         "key": job["video"]["key"], "video": job["video"],
+                                         "document_start": job["video"].get("document_start", 0),
+                                         "preferred_language": job["preferred_language"]})
+                        if len(captions) == 4:
+                            break
+                return 200, {"jobs": pending, "caption_jobs": captions}
+            if path == "/v1/captions":
+                return self._receive_captions(body, client_id, now)
             if path == "/v1/result":
                 job = self._jobs.get(body.get("id", ""))
                 if not job or job["client"] != client_id or job["deadline"] <= now:
@@ -260,6 +333,7 @@ class BrowserBridge(QObject):
                 self._sequences[bridge_key] = seq
                 if path.endswith("closed"):
                     old = self._videos.pop(bridge_key, None)
+                    self._cancel_caption_tab(bridge_key)
                     if old:
                         self.video_changed.emit({"key": old["key"], "tab_id": tab_id, "source_id": client_id,
                                                  "bridge_key": bridge_key, "closed": True})
@@ -267,6 +341,9 @@ class BrowserBridge(QObject):
                     video = normalize_video(body["video"])
                     video.update({"tab_id": tab_id, "source_id": client_id, "bridge_key": bridge_key,
                                   "updated_at": time.time(), "_seen": now})
+                    old = self._videos.get(bridge_key)
+                    if old and (old["key"] != video["key"] or old.get("document_start") != video.get("document_start")):
+                        self._cancel_caption_tab(bridge_key)
                     self._videos[bridge_key] = video
                     self.video_changed.emit({k: v for k, v in video.items() if k != "_seen"})
                 return 200, {"accepted": True}
@@ -278,6 +355,7 @@ class BrowserBridge(QObject):
             expired = [k for k, v in self._videos.items() if now - v["_seen"] > 8]
             for key in expired:
                 video = self._videos.pop(key)
+                self._cancel_caption_tab(key)
                 self.video_changed.emit({"key": video["key"], "tab_id": video["tab_id"],
                                          "source_id": video["source_id"], "bridge_key": key, "closed": True})
             return [{k: list(v) if k == "audio_urls" else v for k, v in video.items() if k != "_seen"}
@@ -287,10 +365,112 @@ class BrowserBridge(QObject):
         videos = self.videos()
         return videos[0] if videos else None
 
+    def request_captions(self, video: dict, generation=0, timeout: float = 12,
+                         source_language: str = "auto") -> str:
+        """Request a site's existing text track without blocking the Qt thread.
+
+        ``captions_ready`` carries the caller's generation/request ID. A missing
+        track is ``unavailable``; failed retrieval is ``error`` or ``timeout``.
+        Calling cancel_captions suppresses all later results for that request.
+        """
+        clean = normalize_video(video)
+        bridge_key = str(video.get("bridge_key", ""))
+        with self._lock:
+            current = self._videos.get(bridge_key)
+            if (not self._server or not current or current["key"] != clean["key"] or
+                    current.get("document_start", 0) != clean.get("document_start", 0)):
+                raise ValueError("网页视频已切换或浏览器连接已断开，请重新选择视频")
+            timeout = max(.1, min(float(timeout), 30))
+            job_id = secrets.token_hex(16)
+            # Send only video identity, never the ephemeral audio URL list.
+            identity = {k: current[k] for k in ("key", "platform", "video_id", "url", "page", "cid",
+                                               "tab_id", "source_id", "bridge_key", "document_start")}
+            timer = threading.Timer(timeout, self._caption_timeout, args=(job_id,))
+            timer.daemon = True
+            self._caption_jobs[job_id] = {"client": current["source_id"], "video": identity,
+                "generation": generation, "preferred_language": str(source_language)[:32], "sent": False,
+                "deadline": time.monotonic() + timeout, "timer": timer, "parts": {}, "part_count": None,
+                "bytes": 0, "language": "", "caption_source": ""}
+            timer.start()
+            return job_id
+
+    def cancel_captions(self, request_id: str):
+        with self._lock:
+            job = self._caption_jobs.pop(request_id, None)
+            if job:
+                job["timer"].cancel()
+
+    def _cancel_caption_tab(self, bridge_key: str):
+        for job_id, job in list(self._caption_jobs.items()):
+            if job["video"]["bridge_key"] == bridge_key:
+                self.cancel_captions(job_id)
+
+    def _finish_captions(self, job_id: str, status: str, cues=None):
+        job = self._caption_jobs.pop(job_id, None)
+        if not job:
+            return
+        job["timer"].cancel()
+        event = {**job["video"], "request_id": job_id, "generation": job["generation"],
+                 "status": status, "source_language": job["language"],
+                 "caption_source": job["caption_source"], "cues": cues or []}
+        if status == "error":
+            event["message"] = "读取网站已有字幕失败，可以重试或回退语音识别"
+        elif status == "timeout":
+            event["message"] = "等待网站原字幕超时，可以重试或回退语音识别"
+        self.captions_ready.emit(event)
+
+    def _caption_timeout(self, job_id: str):
+        with self._lock:
+            self._finish_captions(job_id, "timeout")
+
+    def _receive_captions(self, body: dict, client_id: str, now: float):
+        job_id = body.get("id", "")
+        job = self._caption_jobs.get(job_id)
+        if not job or job["client"] != client_id or job["deadline"] <= now:
+            return 200, {"accepted": False}
+        current = self._videos.get(job["video"]["bridge_key"])
+        try:
+            incoming = normalize_video(body.get("video", {}))
+            if (not current or current["key"] != job["video"]["key"] or incoming["key"] != current["key"] or
+                    int(body.get("tab_id", -1)) != current["tab_id"] or
+                    float(body.get("document_start", -1)) != current.get("document_start", 0)):
+                return 200, {"accepted": False}
+            status = body.get("status")
+            if status in {"error", "unavailable"}:
+                self._finish_captions(job_id, status)
+                return 200, {"accepted": True}
+            if status != "ready":
+                raise ValueError("invalid caption status")
+            part, count = int(body.get("part", 0)), int(body.get("part_count", 1))
+            if not 0 <= part < count <= 256 or (job["part_count"] not in (None, count)):
+                raise ValueError("invalid caption chunks")
+            if part in job["parts"]:
+                return 200, {"accepted": False}
+            language = str(body.get("source_language", ""))[:32]
+            if job["parts"] and language != job["language"]:
+                raise ValueError("changed caption language")
+            cues = normalize_caption_cues(body.get("cues"), language)
+            job["bytes"] += len(json.dumps(cues, ensure_ascii=False).encode("utf-8"))
+            if job["bytes"] > 8 * 1024 * 1024:
+                raise ValueError("captions too large")
+            job["part_count"], job["language"] = count, language
+            source = str(body.get("caption_source", ""))
+            job["caption_source"] = source if source in {"youtube-human", "youtube-asr", "bilibili-human", "bilibili-asr"} else current["platform"]
+            job["parts"][part] = cues
+            if len(job["parts"]) == count:
+                output = [cue for index in range(count) for cue in job["parts"][index]]
+                if len(output) > 20000:
+                    raise ValueError("captions too long")
+                self._finish_captions(job_id, "ready", sorted(output, key=lambda c: (c["start"], c["end"])))
+            return 200, {"accepted": True}
+        except (KeyError, TypeError, ValueError, OverflowError):
+            self._finish_captions(job_id, "error")
+            return 200, {"accepted": True}
+
     def translate(self, texts: list[str], source: str, target: str, timeout: float = 30) -> list[str]:
         if not texts:
             return []
-        if len(texts) > 20 or sum(len(t) for t in texts) > 30000:
+        if len(texts) > 30 or sum(len(t) for t in texts) > 30000:
             raise TranslationError("单次翻译字幕过多，请分批处理")
         with self._lock:
             now = time.monotonic()

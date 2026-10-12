@@ -13,7 +13,6 @@ DEFAULTS = {
     "model": "small",
     "device": "auto",
     "translation_mode": "google",
-    "chunk_seconds": 4,
     "overlay_width": 940,
     "primary_size": 30,
     "secondary_size": 24,

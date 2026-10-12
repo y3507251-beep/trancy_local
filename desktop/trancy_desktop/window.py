@@ -1,26 +1,27 @@
 from __future__ import annotations
 
 import html
+import math
 import threading
 import time
 import uuid
-from collections import deque
 from pathlib import Path
 
 from PyQt6.QtCore import QTimer, Qt, pyqtSignal
 from PyQt6.QtGui import QAction, QColor, QIcon
 from PyQt6.QtWidgets import (
     QCheckBox, QColorDialog, QComboBox, QFileDialog, QFormLayout, QGroupBox,
-    QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox, QProgressBar,
+    QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox,
     QPushButton, QSlider, QSpinBox, QSplitter, QSystemTrayIcon, QTabWidget, QScrollArea,
     QTextEdit, QVBoxLayout, QWidget, QMenu,
 )
 
-from .audio_capture import SystemAudioCapture
 from .browser_bridge import BrowserBridge
 from .media_download import MediaDownloader
+from .native_subtitles import NativeSubtitleReader
 from .overlay import SubtitleOverlay
 from .pipeline import TranslationQueue
+from .playback import PlaybackBuffer
 from .potplayer import PotPlayerAdapter
 from .recognition import ASRSession
 from .settings import CACHE, DATA, ROOT, TEMP, Settings
@@ -47,8 +48,6 @@ QTextEdit { background: #171b26; border: 1px solid #323647; border-radius: 8px; 
 QTabWidget::pane { border: 1px solid #323647; border-radius: 8px; }
 QTabBar::tab { background: #202330; padding: 11px 16px; border-top-left-radius: 6px; border-top-right-radius: 6px; }
 QTabBar::tab:selected { background: #3c2b56; color: #e8d9ff; }
-QProgressBar { border: none; background: #252b39; border-radius: 4px; min-height: 8px; max-height: 8px; }
-QProgressBar::chunk { background: #9870ed; border-radius: 4px; }
 QSlider::groove:horizontal { background: #353a4e; height: 5px; border-radius: 2px; }
 QSlider::handle:horizontal { background: #b491fb; width: 13px; margin: -5px 0; border-radius: 6px; }
 QMenu { background: #202431; border: 1px solid #3b4055; }
@@ -62,7 +61,7 @@ class MainWindow(QMainWindow):
     def __init__(self, settings=None):
         super().__init__()
         self.settings = settings or Settings()
-        self.setWindowTitle("Trancy 桌面字幕 · 系统声音 / PotPlayer / B站 / YouTube")
+        self.setWindowTitle("Trancy 桌面字幕 · PotPlayer / B站 / YouTube")
         icon = ROOT.parent / "assets/icons/ic128.png"
         if icon.exists():
             self.setWindowIcon(QIcon(str(icon)))
@@ -77,18 +76,26 @@ class MainWindow(QMainWindow):
         self.source_title = ""
         self._active = None
         self._pending_file = None
-        self._chunks = deque()
-        self._capture_dir = None
-        self._pending_capture = None
         self._pending_download = None
         self._download_context = None
         self._source_config = {}
         self._translation_mode = "google"
         self._source_complete = False
-        self._latest_live = None
-        self._live_received = 0.0
-        self._live_started = None
-        self._live_clock_job = None
+        self._source_kind = "asr"
+        self._media_source = None
+        self._buffer = PlaybackBuffer()
+        self._native_readers = {}
+        self._caption_context = None
+        self._last_playback = None
+        self._recognition_blocked = False
+        self._history_pending = False
+        self._history_updated = 0.0
+        self._history_html = ""
+        self._cache_pending = False
+        self._cache_updated = 0.0
+        self._cache_restored = False
+        self._native_translation_cache = {}
+        self._translation_dirty = True
         self._displayed_key = None
         self._last_video = None
         self._bound_tab = None
@@ -105,18 +112,15 @@ class MainWindow(QMainWindow):
         self.asr.updated.connect(self._asr_event)
         self.asr.idle.connect(self._schedule)
         self.asr.closed.connect(self._asr_closed)
-        self.capture = SystemAudioCapture(self)
-        self.capture.chunk_ready.connect(self._chunk_ready)
-        self.capture.level.connect(lambda value: self.level.setValue(min(100, round(value * 100))))
-        self.capture.error.connect(self._capture_error)
-        self.capture.stopped.connect(self._start_pending_capture)
         self.bridge = BrowserBridge(self)
         self.bridge.video_changed.connect(self._browser_update)
+        self.bridge.captions_ready.connect(self._browser_captions)
         self.bridge.status_changed.connect(self.web_status.setText)
         self.translator = TranslationQueue(self.bridge, self)
         self.translator.translated.connect(self._translated)
         self.translator.failed.connect(lambda e: self._translation_error(e))
         self.translator.status.connect(self._status)
+        self.translator.closed.connect(self._translation_closed)
         self.pot = PotPlayerAdapter(self)
         self.pot.state_changed.connect(self._pot_update)
         self.pot.error.connect(self._status)
@@ -135,7 +139,6 @@ class MainWindow(QMainWindow):
         self.tick.timeout.connect(self._tick)
         self.tick.start()
         self._setup_tray()
-        self._refresh_devices()
         self.overlay.preview()
         QTimer.singleShot(5000, self._end_preview)
 
@@ -156,7 +159,7 @@ class MainWindow(QMainWindow):
         title = QLabel("Trancy 桌面字幕")
         title.setObjectName("title")
         layout.addWidget(title)
-        hint = QLabel("语音识别 · 中英互译 · 自由拖动的桌面字幕")
+        hint = QLabel("本地与网页视频 · 中英互译 · 自由拖动的桌面字幕")
         hint.setObjectName("subtitle")
         layout.addWidget(hint)
         self.status = QLabel("准备就绪 · 选择声音来源后开始")
@@ -180,7 +183,7 @@ class MainWindow(QMainWindow):
         engine_group = QGroupBox("识别与翻译")
         form = QFormLayout(engine_group)
         self.model = QComboBox()
-        for name, value in (("Whisper Small · 实时优先", "small"), ("Whisper Large v3", "large-v3"),
+        for name, value in (("Whisper Small · 轻量识别", "small"), ("Whisper Large v3", "large-v3"),
                             ("千问 Qwen3-ASR 1.7B", "qwen3-asr-1.7b")):
             self.model.addItem(name, value)
         self.model.setCurrentIndex(max(0, self.model.findData(self.settings.get("model"))))
@@ -204,33 +207,6 @@ class MainWindow(QMainWindow):
 
         self.tabs = QTabWidget()
         left.addWidget(self.tabs)
-        live = QWidget()
-        live_form = QVBoxLayout(live)
-        text = QLabel("捕获 Windows 声音输出，分段识别并持续显示中英字幕。")
-        text.setWordWrap(True)
-        live_form.addWidget(text)
-        device_row = QHBoxLayout()
-        self.audio_device = QComboBox()
-        device_row.addWidget(self.audio_device, 1)
-        device_row.addWidget(self._button("刷新", self._refresh_devices))
-        live_form.addLayout(device_row)
-        chunk_row = QHBoxLayout()
-        chunk_row.addWidget(QLabel("每段音频"))
-        self.chunk_seconds = QSpinBox()
-        self.chunk_seconds.setRange(2, 12)
-        self.chunk_seconds.setSuffix(" 秒")
-        self.chunk_seconds.setValue(int(self.settings.get("chunk_seconds", 4)))
-        chunk_row.addWidget(self.chunk_seconds)
-        chunk_row.addStretch()
-        live_form.addLayout(chunk_row)
-        self.level = QProgressBar()
-        self.level.setRange(0, 100)
-        self.level.setValue(0)
-        self.level.setTextVisible(False)
-        live_form.addWidget(self.level)
-        live_form.addWidget(self._button("开始实时双语字幕", self.start_live, True))
-        self.tabs.addTab(live, "系统声音")
-
         player = QWidget()
         player_layout = QVBoxLayout(player)
         self.pot_status = QLabel("正在查找 PotPlayer…")
@@ -262,11 +238,11 @@ class MainWindow(QMainWindow):
 
         controls = QHBoxLayout()
         controls.addWidget(self._button("停止当前任务", self.stop))
-        controls.addWidget(self._button("重试未完成翻译", self.retry_translation))
+        controls.addWidget(self._button("重试未完成字幕", self.retry_translation))
         left.addLayout(controls)
         self.history = QTextEdit()
         self.history.setReadOnly(True)
-        self.history.setPlaceholderText("识别出的原文和译文将在这里显示。")
+        self.history.setPlaceholderText("字幕原文和译文将在这里显示。")
         self.history.setMinimumHeight(145)
         left.addWidget(self.history, 1)
 
@@ -362,16 +338,6 @@ class MainWindow(QMainWindow):
             self.service_root.setText(path)
             self.settings.update(service_root=path)
 
-    def _refresh_devices(self):
-        if not hasattr(self, "audio_device"):
-            return
-        self.audio_device.clear()
-        self.audio_device.addItem("系统默认输出（开始时）", None)
-        try:
-            for device in SystemAudioCapture.devices():
-                self.audio_device.addItem(str(device.get("name", "声音输出")), device.get("index"))
-        except Exception as error:
-            self._status(f"系统取音尚未就绪：{error}")
 
     def _toggle_overlay(self, visible):
         if hasattr(self, "overlay"):
@@ -403,62 +369,27 @@ class MainWindow(QMainWindow):
         self._translation_mode = self.engine.currentData()
         self.timeline.clear()
         self._source_complete = False
+        self._source_kind = "asr"
+        self._buffer = PlaybackBuffer()
+        self._recognition_blocked = False
+        self._last_playback = None
+        self._cache_pending = False
+        self._cache_updated = 0.0
+        self._cache_restored = False
+        self._native_translation_cache = {}
+        self._translation_dirty = True
+        self._history_pending = False
+        self._history_updated = 0.0
+        self._history_html = ""
         self._displayed_key = None
-        self._latest_live = None
-        self._live_received = 0.0
-        self._live_started = None
-        self._live_clock_job = None
         self.history.clear()
         self.overlay.show_caption("")
         self.settings.update(service_root=self.service_root.text().strip(),
-                             chunk_seconds=self.chunk_seconds.value(),
                              follow_potplayer=self.follow_pot.isChecked(), follow_browser=self.follow_web.isChecked())
 
-    def start_live(self):
-        self._new_source("live", f"live:{uuid.uuid4().hex}", "系统声音")
-        directory = TEMP / self.identity.replace(":", "-")
-        directory.mkdir(parents=True, exist_ok=True)
-        self._capture_dir = directory.resolve()
-        self._pending_capture = dict(generation=self.generation, directory=str(directory),
-                                     chunk_seconds=float(self.chunk_seconds.value()),
-                                     device_index=self.audio_device.currentData())
-        self._status("正在准备系统声音捕获…")
-        self._start_pending_capture()
 
-    def _start_pending_capture(self):
-        pending = self._pending_capture
-        if pending is None or self._closing or self.capture.running:
-            return
-        self._pending_capture = None
-        if self.mode != "live" or pending["generation"] != self.generation:
-            return
-        try:
-            self.capture.start(pending["directory"], chunk_seconds=pending["chunk_seconds"],
-                               device_index=pending["device_index"])
-            if self.mode == "live":
-                self._status("正在捕获系统声音 · 有语音时生成中英字幕")
-        except Exception as error:
-            self._capture_error(str(error))
 
-    def _capture_error(self, text):
-        if self._pending_capture is not None or self.mode != "live":
-            return
-        if self.mode == "live":
-            self.stop()
-        self._status(text)
 
-    def _chunk_ready(self, path, start, end):
-        if (self.mode != "live" or self._closing or self._capture_dir is None
-                or Path(path).resolve().parent != self._capture_dir):
-            self._recycle([path])
-            return
-        self._chunks.append(dict(source=path, offset=start, generation=self.generation, temporary=True,
-                                 options=dict(self._source_config)))
-        while len(self._chunks) > 3:
-            dropped = self._chunks.popleft()
-            self._recycle([dropped["source"]])
-            self._status("识别速度暂时低于播放速度，正在优先处理最新声音；可选择更小模型或 GPU。")
-        self._schedule()
 
     def _open_pot_file(self):
         path, _ = QFileDialog.getOpenFileName(self, "选择视频", "", "视频和音频 (*.mp4 *.mkv *.avi *.mov *.wmv *.flv *.webm *.m4v *.wav *.mp3 *.m4a);;所有文件 (*)")
@@ -476,7 +407,8 @@ class MainWindow(QMainWindow):
             return
         identity = file_identity(path)
         self._new_source("potplayer", identity, state.get("title") or Path(path).name)
-        self._queue_file(path, temporary=False)
+        self._restore_cache()
+        self._read_local_subtitles(path)
 
     def _pot_update(self, state):
         path = state.get("path") or ""
@@ -510,12 +442,18 @@ class MainWindow(QMainWindow):
                 self.stop()
                 self._status("网页视频已关闭或连接已断开，请重新选择视频。")
                 return
+            previous = self._last_video
             self._last_video = dict(video, received_at=time.monotonic())
             if browser_identity(video) != self.identity:
                 if self.follow_web.isChecked():
                     self._start_browser_video(video)
                 else:
                     self.overlay.show_caption("")
+            elif (previous is not None and previous.get("document_start", 0) != video.get("document_start", 0)):
+                # A reload replaces the page's pending caption request even
+                # when the video ID is unchanged and automatic following is off.
+                self.stop()
+                self._start_browser_video(video)
         current = self._selected_browser()
         if current:
             self.web_position.setText(f"{self._time(current.get('position', 0))} / {self._time(current.get('duration', 0))}")
@@ -549,19 +487,103 @@ class MainWindow(QMainWindow):
         self._new_source("browser", browser_identity(video), video.get("title", "网页视频"))
         self._bound_tab = self._browser_tab(video)
         self._last_video = dict(video, received_at=time.monotonic())
-        cached = self._cached_cues()
-        if cached:
-            self.timeline.add(cached)
-            self._source_complete = True
-            self._render_history()
+        self._buffer.set_duration(video.get("duration"))
+        self._restore_cache()
+        context = dict(generation=self.generation, identity=self.identity, tab=self._bound_tab,
+                       video=dict(video), request_id=None)
+        self._caption_context = context
+        self._status("正在读取网页原字幕 · 有字幕时直接翻译")
+        try:
+            request_id = self.bridge.request_captions(video, generation=self.generation)
+            if self._caption_context is context:
+                context["request_id"] = request_id
+        except Exception as error:
+            if self._caption_context is context:
+                self._caption_context = None
+                self._fallback_browser_audio(video, f"网页原字幕读取失败：{error}")
+
+    def _browser_captions(self, event):
+        context = self._caption_context
+        if (context is None or self.mode != "browser" or self._closing
+                or context["generation"] != self.generation
+                or event.get("generation") != self.generation
+                or context["identity"] != self.identity
+                or (context.get("request_id") and event.get("request_id") != context["request_id"])):
+            return
+        if event.get("bridge_key") and event["bridge_key"] != self._bound_tab:
+            return
+        expected = context["video"]
+        if (event.get("document_start", 0) != expected.get("document_start", 0)
+                or (expected.get("key") and event.get("key") != expected["key"])
+                or self._last_video is None
+                or self._last_video.get("document_start", 0) != expected.get("document_start", 0)
+                or browser_identity(self._last_video) != context["identity"]):
+            return
+        if event.get("status") == "ready" and event.get("cues"):
+            context["ready"] = True
+            self._install_native(event["cues"], event.get("source_language", ""))
+        elif not context.get("ready"):
+            self._caption_context = None
+            status = event.get("status")
+            reason = "视频没有可用原字幕" if status == "unavailable" else "原字幕未能取得"
+            self._fallback_browser_audio(context["video"], reason)
+
+    def _fallback_browser_audio(self, video, reason):
+        if self._source_complete:
             self._status("已加载缓存字幕，正在跟随网页播放进度。")
             return
         directory = TEMP / ("web-" + uuid.uuid4().hex)
         directory.mkdir(parents=True, exist_ok=True)
         self._pending_download = dict(generation=self.generation, video=dict(video), directory=str(directory),
                                       options=dict(self._source_config))
-        self._status("正在获取网页视频音频…")
+        self._status(reason + " · 正在获取音轨，随后只识别播放位置附近的片段")
         self._start_pending_download()
+
+    def _read_local_subtitles(self, path):
+        job_id = uuid.uuid4().hex
+        reader = NativeSubtitleReader(path, job_id, service_root=self._source_config["service_root"], parent=self)
+        context = dict(reader=reader, generation=self.generation, identity=self.identity, source=path)
+        self._native_readers[job_id] = context
+        reader.updated.connect(lambda event, key=job_id: self._local_captions(key, event))
+        reader.finished.connect(lambda key=job_id: self._local_reader_finished(key))
+        self._status("正在读取本地原字幕 · 有字幕时不启动语音识别")
+        reader.start()
+
+    def _local_captions(self, job_id, event):
+        context = self._native_readers.get(job_id)
+        if (context is None or context["generation"] != self.generation or self.mode != "potplayer"
+                or context["identity"] != self.identity or self._closing):
+            return
+        self._buffer.set_duration(event.get("source_duration") or event.get("duration"))
+        if event.get("event") == "result" and event.get("cues"):
+            self._install_native(event["cues"], event.get("source_language", ""))
+        elif event.get("event") in ("result", "error"):
+            self._queue_file(context["source"], temporary=False)
+
+    def _local_reader_finished(self, job_id):
+        context = self._native_readers.pop(job_id, None)
+        if context:
+            context["reader"].deleteLater()
+
+    def _install_native(self, cues, language=""):
+        if self._source_kind != "native":
+            self.timeline.clear()
+        self._source_kind, self._source_complete = "native", True
+        prepared = []
+        for cue in cues:
+            source, target = detect_target(cue["text"], cue.get("source_language") or language)
+            key = source, target, " ".join(cue["text"].split())
+            item = dict(cue, source_language=source)
+            if not item.get("translation") and key in self._native_translation_cache:
+                item["translation"] = self._native_translation_cache[key]
+                item["target_language"] = target
+            prepared.append(item)
+        self.timeline.add(prepared)
+        self._displayed_key = None
+        self._render_history()
+        self._update_translation_window()
+        self._save_cache()
+        self._status("已读取原字幕 · 按播放位置提前翻译，无需语音识别")
 
     def _start_pending_download(self):
         if (self._closing or self._pending_download is None or self._download_context is not None
@@ -589,7 +611,7 @@ class MainWindow(QMainWindow):
     def _download_failed(self, message):
         context, self._download_context = self._download_context, None
         if context and context["generation"] == self.generation and self.mode == "browser":
-            self._status(f"网页音频获取失败：{message}。也可切换到系统声音模式。")
+            self._status(f"网页音频获取失败：{message}。请在原网页播放后重试。")
 
     def _cached_cues(self):
         # The extension's current engine can change without a desktop event.
@@ -597,20 +619,114 @@ class MainWindow(QMainWindow):
             return []
         return self.cache.read(self.identity, self._source_config["model"], self._translation_mode)
 
+    def _restore_cache(self):
+        if self._cache_restored or self._translation_mode == "plugin":
+            return
+        self._cache_restored = True
+        native = self.cache.read_bundle(self.identity, "native", self._translation_mode)
+        self._remember_native_translations(native)
+        bundle = self.cache.read_bundle(self.identity, self._source_config["model"], self._translation_mode)
+        # Native subtitles are probed again: a sidecar may have changed while the
+        # media file's identity stayed the same. Browser captions have their own cache.
+        if not bundle:
+            return
+        if bundle.get("source_kind") == "native":
+            self._remember_native_translations(bundle)
+            return
+        self.timeline.add(bundle.get("cues", []))
+        self._buffer = PlaybackBuffer(bundle.get("coverage", []), bundle.get("duration"))
+        self._source_complete = bool(bundle.get("corpus_complete"))
+        self._render_history()
+        self._update_translation_window()
+
+    def _remember_native_translations(self, bundle):
+        for cue in bundle.get("cues", []) if bundle else ():
+            if cue.get("translation"):
+                source, target = detect_target(cue["text"], cue.get("source_language", ""))
+                self._native_translation_cache[source, target, " ".join(cue["text"].split())] = cue["translation"]
+
     def _queue_file(self, path, temporary):
-        cached = self._cached_cues()
-        if cached:
-            self.timeline.add(cached)
-            self._source_complete = True
-            self._render_history()
+        self._restore_cache()
+        if self._source_complete:
             self._status("已加载缓存双语字幕，正在同步播放。")
             if temporary:
                 self._recycle([path])
             return
-        self._pending_file = dict(source=str(path), offset=0.0, generation=self.generation, temporary=temporary,
+        self._media_source = dict(source=str(path), generation=self.generation, temporary=temporary)
+        self._drive_buffer()
+
+    def _playback_clock(self):
+        if self.mode == "potplayer":
+            state = self.pot.snapshot()
+            path = state.get("path")
+            if (state.get("connected") and path and Path(path).is_file()
+                    and file_identity(path) == self.identity):
+                self._buffer.set_duration(state.get("duration"))
+                return state.get("position"), state.get("paused", True), state.get("rate") or 1
+        elif self.mode == "browser" and self._last_video:
+            video = self._last_video
+            elapsed = time.monotonic() - video["received_at"]
+            if (elapsed < 4 and not video.get("ad_playing") and not video.get("closed")
+                    and browser_identity(video) == self.identity):
+                position = float(video.get("position") or 0)
+                if not video.get("paused", True):
+                    position += min(elapsed, 1.5) * float(video.get("rate") or 1)
+                self._buffer.set_duration(video.get("duration"))
+                return position, video.get("paused", True), video.get("rate") or 1
+        return None, True, 1
+
+    def _update_translation_window(self, *, retry=False):
+        if self.mode not in ("potplayer", "browser"):
+            return
+        position, _, _ = self._playback_clock()
+        if position is None:
+            self._translation_dirty = True
+            return
+        self.translator.update_window(self.generation, self.timeline.cues, float(position or 0), "",
+                                      self._translation_mode, retry=retry)
+        self._translation_dirty = False
+
+    def _drive_buffer(self, position=None, paused=None):
+        if (self._closing or self.mode not in ("potplayer", "browser") or self._media_source is None
+                or self._media_source["generation"] != self.generation or self._source_complete
+                or self._active is not None or self._pending_file is not None or self._recognition_blocked):
+            return
+        if position is None:
+            position, paused, _ = self._playback_clock()
+        if position is None:
+            return
+        window = self._buffer.next_window(float(position or 0), paused=bool(paused))
+        if window is None:
+            return
+        start, end = window
+        # The reusable input survives individual windows; stop retires it once
+        # the worker no longer reads it. Original local files are never recycled.
+        self._pending_file = dict(source=self._media_source["source"], offset=0.0,
+                                  generation=self.generation, temporary=False, window=(start, end),
                                   options=dict(self._source_config))
-        self._status("正在准备识别音频…")
+        self._status(f"正在识别播放附近音频 {self._time(start)}–{self._time(end)}")
         self._schedule()
+
+    def _sync_playback(self, position, paused, rate):
+        now = time.monotonic()
+        seek = False
+        if self._last_playback is not None:
+            previous, timestamp, was_paused, previous_rate = self._last_playback
+            expected = previous if was_paused else previous + max(0, now - timestamp) * previous_rate
+            seek = abs(position - expected) > 3
+        self._last_playback = (position, now, bool(paused), float(rate))
+        if self._translation_dirty:
+            self._update_translation_window()
+        self.translator.set_position(self.generation, position, seek=seek)
+        if seek:
+            self._buffer.seek()
+            self._recognition_blocked = False
+            if self._pending_file and self._pending_file.get("window"):
+                self._pending_file = None
+            task = self._active
+            if task and task.get("window") and not task["window"][0] <= position < task["window"][1]:
+                self.asr.cancel()
+        self._drive_buffer(position, paused)
 
     def _schedule(self):
         if self._closing or self._active is not None:
@@ -618,8 +734,6 @@ class MainWindow(QMainWindow):
         item = self._pending_file
         if item is not None:
             self._pending_file = None
-        elif self._chunks:
-            item = self._chunks.popleft()
         else:
             return
         if item["generation"] != self.generation:
@@ -631,10 +745,13 @@ class MainWindow(QMainWindow):
         item["mode"] = self.mode
         self._active = item
         try:
+            cut = (dict(start_seconds=item["window"][0], duration_seconds=item["window"][1] - item["window"][0])
+                   if item.get("window") else {})
             accepted = self.asr.submit(item["source"], item["job_id"], offset_seconds=item["offset"],
-                                       **item.get("options", self._source_config))
+                                       **cut, **item.get("options", self._source_config))
         except Exception as error:
             self._status(f"无法启动识别：{error}")
+            self._recognition_blocked = bool(item.get("window"))
             if self._active is item:
                 self._active = None
                 if item["temporary"]:
@@ -646,10 +763,7 @@ class MainWindow(QMainWindow):
             if self._active is not item:
                 return
             self._active = None
-            if self.mode == "live":
-                self._chunks.appendleft(item)
-            else:
-                self._pending_file = item
+            self._pending_file = item
             QTimer.singleShot(500, self._schedule)
 
     def _asr_event(self, event):
@@ -659,7 +773,8 @@ class MainWindow(QMainWindow):
         task = self._active
         if task is None or event.get("job_id") != task["job_id"]:
             return
-        current = task["generation"] == self.generation and not self._closing
+        current = (task["generation"] == self.generation and not self._closing
+                   and not (task.get("window") and self._source_kind == "native"))
         if current and kind == "state":
             message = event.get("message") or event.get("status")
             if message:
@@ -672,127 +787,122 @@ class MainWindow(QMainWindow):
                 added = self.timeline.replace_job(task["job_id"], cues)
             else:
                 added = self.timeline.add(cues)
-            if self.mode == "live":
-                self._refresh_live_caption()
-                if cues:
-                    self._live_received = time.monotonic()
-                if self._latest_live:
-                    self.timeline.trim_before(self._latest_live["end"] - 120)
             if added:
-                self.translator.enqueue(self.generation, added, event.get("detected_language", ""),
-                                        self._translation_mode, realtime=self.mode == "live")
+                self._update_translation_window()
             self._displayed_key = None
             self._render_history()
         if kind in ("result", "error", "cancelled"):
             if current:
                 if kind == "result":
-                    self._source_complete = self.mode != "live"
-                    self._status("字幕识别完成，正在补齐译文并同步播放。" if self.mode != "live" else "正在识别系统声音…")
+                    if task.get("window"):
+                        start, end = task["window"]
+                        self._buffer.set_duration(event.get("source_duration"))
+                        end = min(end, float(event.get("segment_end", end)))
+                        if self._buffer.duration:
+                            end = min(end, self._buffer.duration)
+                        self._buffer.mark(start, end)
+                        self._source_complete = self._buffer.complete
+                        self._status("播放附近字幕已识别 · 提前准备后续片段，缓冲充足时暂停计算")
+                    else:
+                        self._source_complete = True
+                        self._status("字幕识别完成，正在补齐译文并同步播放。")
                     self._save_cache()
                 elif kind == "error":
+                    self._recognition_blocked = bool(task.get("window"))
                     self._status("识别失败：" + str(event.get("message", "未知错误")))
-            if task["temporary"]:
-                self._recycle([task["source"]])
+            self._release_task_source(task)
             self._active = None
             QTimer.singleShot(0, self._schedule)
 
     def _translated(self, event):
-        if event["generation"] != self.generation or self._closing:
+        epoch = getattr(self.translator, "epoch", event.get("epoch"))
+        if (event["generation"] != self.generation or self._closing
+                or event.get("epoch", epoch) != epoch):
             return
-        updated = self.timeline.update_translations(event["cues"])
-        if self.mode == "live" and updated:
-            self._refresh_live_caption()
-            if self._latest_live and any(c.get("_job_id") == self._latest_live.get("_job_id") for c in updated):
-                self._live_received = time.monotonic()
+        self.timeline.update_translations(event["cues"])
         self._displayed_key = None
         self._render_history()
         self._save_cache()
 
-    def _refresh_live_caption(self):
-        if not self.timeline.cues:
-            self._latest_live = None
-            self._live_started = None
-            self._live_clock_job = None
-            return
-        latest = self.timeline.cues[-1]
-        # A short chunk can produce several cues at once. Show the entire chunk
-        # so earlier words are not lost just because inference returned quickly.
-        job = latest.get("_job_id")
-        cues = [c for c in self.timeline.cues if c.get("_job_id") == job] if job else [latest]
-        source = latest.get("source_language") or detect_target(latest["text"])[0]
-        self._latest_live = dict(start=cues[0]["start"], end=cues[-1]["end"], _job_id=job,
-                                 text=" ".join(c["text"] for c in cues),
-                                 translation=" ".join(c["translation"] for c in cues if c.get("translation")),
-                                 source_language=source, words=[w for c in cues for w in (c.get("words") or [])],
-                                 timing_source=latest.get("timing_source", "cue"))
-        clock_job = job or (cues[0]["start"], cues[-1]["end"])
-        if clock_job != self._live_clock_job:
-            self._live_clock_job = clock_job
-            self._live_started = None
-        english_ready = not str(source).startswith("zh") or bool(self._latest_live["translation"])
-        if english_ready and self._live_started is None:
-            self._live_started = time.monotonic()
 
     def _translation_error(self, event):
-        if event["generation"] == self.generation:
+        epoch = getattr(self.translator, "epoch", event.get("epoch"))
+        if event["generation"] == self.generation and event.get("epoch", epoch) == epoch and not self._closing:
+            self.timeline.translation_failed(event.get("cues", []), event["message"])
+            self._render_history()
             self._status("翻译失败，原文已保留：" + event["message"])
 
     def retry_translation(self):
+        self._recognition_blocked = False
+        self._drive_buffer()
         cues = [c for c in self.timeline.cues if not c.get("translation")]
         if cues:
-            self.translator.enqueue(self.generation, cues, "", self._translation_mode, self.mode == "live")
+            for cue in cues:
+                cue.pop("translation_error", None)
+            self._update_translation_window(retry=True)
             self._status("正在重试未完成的译文…")
 
-    def _save_cache(self):
-        if (self._source_complete and self.identity and self.mode in ("potplayer", "browser")
+    def _save_cache(self, *, force=False):
+        if (self.identity and self.mode in ("potplayer", "browser")
                 and self._translation_mode != "plugin"):
+            now = time.monotonic()
+            if not force and now - self._cache_updated < 2:
+                self._cache_pending = True
+                return
             try:
-                self.cache.write(self.identity, self._source_config["model"], self._translation_mode, self.timeline.cues)
+                model = "native" if self._source_kind == "native" else self._source_config["model"]
+                self.cache.write_bundle(self.identity, model, self._translation_mode,
+                                        self.timeline.cues, coverage=self._buffer.coverage,
+                                        duration=self._buffer.duration, corpus_complete=self._source_complete,
+                                        source_kind=self._source_kind)
+                self._cache_pending, self._cache_updated = False, now
             except OSError as error:
                 self._status(f"字幕可继续显示，但缓存未保存：{error}")
 
     def _render_history(self):
+        now = time.monotonic()
+        if now - self._history_updated < .3:
+            self._history_pending = True
+            return
         lines = []
-        for cue in self.timeline.cues[-80:]:
+        position, _, _ = self._playback_clock()
+        visible = self.timeline.near(float(position or 0)) if self.mode in ("potplayer", "browser") else self.timeline.cues[-80:]
+        for cue in visible:
+            translation = cue.get("translation") or ("翻译失败 · 点击重试" if cue.get("translation_error")
+                                                     else "尚未翻译")
             lines.append(f"<p><span style='color:#929cb4'>{self._time(cue['start'])}</span> "
                          f"{html.escape(cue['text'])}<br><span style='color:#c2a6f0'>"
-                         f"{html.escape(cue.get('translation') or '译文生成中…')}</span></p>")
-        self.history.setHtml("".join(lines))
-        self.history.verticalScrollBar().setValue(self.history.verticalScrollBar().maximum())
+                         f"{html.escape(translation)}</span></p>")
+        value = "".join(lines)
+        if value != self._history_html:
+            self._history_html = value
+            self.history.setHtml(value)
+            self.history.verticalScrollBar().setValue(0)
+        self._history_pending, self._history_updated = False, now
 
     def _tick(self):
         if self._closing:
             if self._can_close():
                 self._finish_close()
             return
-        self._start_pending_capture()
         self._start_pending_download()
+        if self._history_pending:
+            self._render_history()
+        if self._cache_pending:
+            self._save_cache()
         cue = None
         position = None
-        if self.mode == "live":
-            if time.monotonic() - self._live_received < 10:
-                cue = self._latest_live
-                if cue and self._live_started is not None:
-                    position = min(cue["end"], cue["start"] + max(0, time.monotonic() - self._live_started))
-        elif self.mode == "potplayer":
-            state = self.pot.snapshot()
-            path = state.get("path")
-            if state.get("connected") and path and Path(path).is_file() and state.get("position") is not None and file_identity(path) == self.identity:
-                position = float(state["position"])
-                cue = self.timeline.at(position)
-        elif self.mode == "browser" and self._last_video:
-            video = self._last_video
-            elapsed = time.monotonic() - video["received_at"]
-            if (elapsed < 4 and not video.get("ad_playing") and not video.get("closed")
-                    and browser_identity(video) == self.identity):
-                position = float(video.get("position") or 0)
-                if not video.get("paused", True):
-                    position += min(elapsed, 1.5) * float(video.get("rate") or 1)
+        if self.mode in ("potplayer", "browser"):
+            position, paused, rate = self._playback_clock()
+            if position is not None:
+                self._sync_playback(float(position), paused, rate)
                 cue = self.timeline.at(position)
         key = (cue_key(cue), cue.get("translation", ""),
                tuple((w.get("text"), w.get("start"), w.get("end")) for w in (cue.get("words") or []))) if cue else None
         if key != self._displayed_key:
             self._displayed_key = key
+            if self.mode in ("potplayer", "browser"):
+                self._render_history()
             if cue:
                 self.overlay.show_cue(cue, position)
             else:
@@ -801,6 +911,7 @@ class MainWindow(QMainWindow):
             self.overlay.set_position(position)
 
     def stop(self):
+        self._save_cache(force=True)
         self.generation += 1
         if hasattr(self, "translator"):
             self.translator.reset(self.generation)
@@ -808,19 +919,28 @@ class MainWindow(QMainWindow):
         self._source_complete = False
         self._bound_tab = None
         self._last_video = None
-        self._live_started = None
-        self._live_clock_job = None
-        self._pending_capture = None
-        self._capture_dir = None
-        if hasattr(self, "capture"):
-            self.capture.stop()
+        self._last_playback = None
+        self._cache_pending = False
+        self._recognition_blocked = False
+        if self._caption_context:
+            request_id = self._caption_context.get("request_id")
+            if request_id:
+                self.bridge.cancel_captions(request_id)
+            self._caption_context = None
+        for context in self._native_readers.values():
+            context["reader"].cancel()
+        source, self._media_source = self._media_source, None
+        if source and source["temporary"]:
+            if self._active and self._active.get("source") == source["source"]:
+                self._active["recycle_source"] = True
+            else:
+                self._recycle([source["source"]])
         if self._pending_download:
             self._recycle([self._pending_download["directory"]])
             self._pending_download = None
         if hasattr(self, "downloader") and (self.downloader.running or self._download_context is not None):
             self.downloader.cancel()
-        pending = list(self._chunks)
-        self._chunks.clear()
+        pending = []
         if self._pending_file:
             pending.append(self._pending_file)
             self._pending_file = None
@@ -871,13 +991,21 @@ class MainWindow(QMainWindow):
         self._backend_closed = True
         if self._closing and self._active:
             task, self._active = self._active, None
-            if task["temporary"]:
-                self._recycle([task["source"]])
+            self._release_task_source(task)
+
+    def _release_task_source(self, task):
+        if task.get("temporary") or task.get("recycle_source"):
+            self._recycle([task["source"]])
+
+    def _translation_closed(self):
+        if self._closing and self._can_close():
+            self._finish_close()
 
     def _can_close(self):
         return (self._backend_closed and self._temp_recycling == 0
-                and not self.capture.running and not self.downloader.running
-                and self._download_context is None)
+                and not self.downloader.running
+                and self._download_context is None and not self._native_readers
+                and self.translator.is_closed)
 
     def closeEvent(self, event):
         if self._closing and self._can_close():
@@ -889,7 +1017,7 @@ class MainWindow(QMainWindow):
         self.stop()
         self._closing = True
         self._close_started = time.monotonic()
-        self.status.setText("正在关闭 · 停止取音并释放本应用的识别进程…")
+        self.status.setText("正在关闭 · 取消任务并释放本应用的识别进程…")
         self.centralWidget().setEnabled(False)
         self.overlay.hide()
         self.pot.stop()

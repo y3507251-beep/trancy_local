@@ -100,20 +100,32 @@ class ASRSession(QObject):
         return self.busy
 
     def submit(self, source: str, job_id: str, *, model="small", device="auto", language="auto",
-               offset_seconds=0.0, service_root=DEFAULT_SERVICE_ROOT) -> bool:
+               offset_seconds=0.0, start_seconds=0.0, duration_seconds=None,
+               service_root=DEFAULT_SERVICE_ROOT) -> bool:
+        """Recognize a bounded media window, retaining the resident model.
+
+        ``start_seconds`` seeks within the source file. ``offset_seconds`` is
+        an additional playback-clock offset (for live audio chunks). Both are
+        applied to relative engine cue/word times once, in this coordinator.
+        The default remains compatible with callers that submit a whole file.
+        """
         if self._closing or self.busy:
             return False
         try:
             root = Path(service_root).resolve(strict=True)
             media = Path(source).resolve(strict=True)
             offset = float(offset_seconds)
+            start = float(start_seconds)
+            duration = None if duration_seconds is None else float(duration_seconds)
             if not media.is_file():
                 raise ValueError("识别来源必须是音频或视频文件")
             if model not in MODELS or device not in ("auto", "cpu", "cuda"):
                 raise ValueError("不支持的识别模型或设备")
             if language not in ("auto", "zh", "en", "ja", "ko"):
                 raise ValueError("不支持的识别语言")
-            if not job_id or not math.isfinite(offset) or offset < 0:
+            if (not job_id or not math.isfinite(offset) or offset < 0 or
+                    not math.isfinite(start) or start < 0 or
+                    duration is not None and (not math.isfinite(duration) or duration <= 0)):
                 raise ValueError("无效的任务标识或字幕起始时间")
             python = self._interpreter(root, model)
             if not python.is_file() or not (root / "service" / "engine.py").is_file():
@@ -126,6 +138,7 @@ class ASRSession(QObject):
             return False
         task = dict(job_id=job_id, request_id=uuid.uuid4().hex, source=str(media), service_root=str(root),
                     job_directory=str(directory), offset_seconds=offset, cancelled=False,
+                    start_seconds=start, duration_seconds=duration,
                     options=dict(model=model, device=device, language=language, batch_size=1, asr_context=""))
         if self.process is not None and not self._stopping and self._compatible(task):
             self._active = task
@@ -240,6 +253,12 @@ class ASRSession(QObject):
         payload.pop("request_id", None)
         payload["job_id"] = task["job_id"]
         kind = payload.get("event")
+        # Worker metadata is on the source-file timeline; a live chunk can
+        # have an additional clock offset, just like its cue and word times.
+        for field in ("segment_start", "segment_end"):
+            if field in payload:
+                payload[field] += task["offset_seconds"]
+        timeline_offset = task["offset_seconds"] + task.get("start_seconds", 0.0)
         if "detected_language" in payload:
             payload["detected_language"] = language_code(payload["detected_language"])
         if kind == "model":
@@ -251,13 +270,13 @@ class ASRSession(QObject):
             self.updated.emit(payload)
             if cues or reset:
                 self.updated.emit(dict(event="cues", job_id=task["job_id"],
-                                     cues=shifted_cues(cues, task["offset_seconds"]), reset_cues=reset,
+                                     cues=shifted_cues(cues, timeline_offset), reset_cues=reset,
                                      detected_language=payload.get("detected_language", "")))
         elif kind in ("result", "error", "cancelled"):
             if task["cancelled"]:
                 payload = dict(event="cancelled", message="已停止当前任务，模型继续保留")
             elif kind == "result":
-                payload["cues"] = shifted_cues(payload.get("cues", []), task["offset_seconds"])
+                payload["cues"] = shifted_cues(payload.get("cues", []), timeline_offset)
             self._active = None
             self._finish(task, payload)
 

@@ -6,9 +6,9 @@ Chrome Manifest V3 扩展，提供 AI 翻译、双语字幕及语言学习功能
 
 ## Windows 桌面字幕
 
-新增 [PyQt6 桌面应用](desktop/README.md)，提供系统声音分段实时翻译、**PotPlayer** 本地视频字幕，以及 B 站 / YouTube 网页视频取音识别。桌面字幕可置顶、跨窗口拖动，并显示中英双语；本地播放器只适配 PotPlayer。
+新增 [PyQt6 桌面应用](desktop/README.md)，只保留 **PotPlayer** 本地视频字幕与 **B 站 / YouTube** 网页视频字幕。系统声音捕获及实时语音翻译已移除；优先读取已有字幕，缺字幕时只识别播放位置附近的音频。桌面字幕可置顶、跨窗口拖动，并显示中英双语；本地播放器只适配 PotPlayer。
 
-桌面端复用 `D:\dev\SubtitleService` 的本地识别模型，翻译沿用插件的 Google 实现或通过浏览器桥接调用插件当前字幕引擎。桌面端生成字幕不要求原视频已有字幕。下文关于 `api.trancy.org` 的说明仍指原扩展的云端转录流程。
+桌面端复用 `D:\dev\SubtitleService` 的本地识别模型，翻译沿用插件的 Google 实现或通过浏览器桥接调用插件当前字幕引擎。桌面端生成字幕不要求原视频已有字幕；翻译参考原插件按播放位置优先，首批 3 句、后续最多 30 句，提前准备最多 90 句，原文、译文与已识别范围可以部分缓存。下文关于 `api.trancy.org` 的说明仍指原扩展的云端转录流程。
 
 网页连接使用独立的 **Trancy 桌面字幕连接器**，ID 为 `phkekicmpkiinghhklcoanjjdnccdeod`，运行目录为 `desktop/data/desktop-connector`，可以与原 Trancy 同时安装。
 

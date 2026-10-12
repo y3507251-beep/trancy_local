@@ -7,6 +7,7 @@
   const reports = new Map();
   const tabSequences = new Map();
   const running = new Set();
+  const captionRequests = new Map();
   const clientId = crypto.randomUUID();
   let session = "", timer = null, ticking = false, lastKeepalive = 0, api = null;
 
@@ -50,6 +51,7 @@
       duration: Number(raw.duration) || 0, rate: Number(raw.rate) || 1, paused: Boolean(raw.paused),
       active: Boolean(sender.tab.active && raw.active), ad_playing: Boolean(raw.ad_playing),
       is_live: Boolean(raw.is_live),
+      document_start: Number(raw.document_start) || 0,
       audio_urls: urls.filter(u => typeof u === "string" && u.length <= 16384 && mediaAllowed(u, raw.platform, cid)).slice(0, 12)};
   }
 
@@ -64,7 +66,7 @@
 
   async function translateJob(job) {
     if (!job || typeof job.id !== "string" || running.has(job.id) || !Array.isArray(job.texts) ||
-        job.texts.length > 20 || job.texts.some(t => typeof t !== "string" || t.length > 30000) ||
+        job.texts.length > 30 || job.texts.some(t => typeof t !== "string" || t.length > 30000) ||
         job.texts.reduce((n, t) => n + t.length, 0) > 30000 ||
         !["en", "zh", "zh-CN", "zh-TW", "auto"].includes(job.source) || !["en", "zh-CN", "zh-TW"].includes(job.target)) return;
     running.add(job.id);
@@ -87,8 +89,93 @@
 
   const nextSequence = tabId => { const n = (tabSequences.get(tabId) || 0) + 1; tabSequences.set(tabId, n); return n; };
 
+  function sameCaptionVideo(left, right) {
+    return left && right && pageIdentity(left.url) === pageIdentity(right.url) &&
+      left.platform === right.platform && left.video_id === right.video_id &&
+      Number(left.page) === Number(right.page) && String(left.cid || "") === String(right.cid || "");
+  }
+
+  async function captionJob(job) {
+    if (!job || !/^[a-f0-9]{32}$/.test(job.id || "") || !Number.isSafeInteger(job.tab_id) ||
+        captionRequests.has(job.id)) return;
+    const entry = videos.get(job.tab_id);
+    if (!entry || !sameCaptionVideo(entry.video, job.video) || entry.documentStart !== job.document_start) {
+      await post("/v1/captions", {id: job.id, tab_id: job.tab_id, video: job.video,
+        document_start: job.document_start, status: "error"}).catch(() => {});
+      return;
+    }
+    captionRequests.set(job.id, {...job, started: Date.now()});
+    try {
+      const reply = await chrome.tabs.sendMessage(job.tab_id, {to: [], kind: "trancy-desktop-captions-request-v1",
+        request_id: job.id, document_start: job.document_start, video: job.video,
+        preferred_language: job.preferred_language}, {frameId: 0});
+      if (!reply?.accepted) throw new Error("caption observer unavailable");
+    } catch (_) {
+      captionRequests.delete(job.id);
+      await post("/v1/captions", {id: job.id, tab_id: job.tab_id, video: job.video,
+        document_start: job.document_start, status: "error"}).catch(() => {});
+    }
+  }
+
+  async function captionResult(message, sender) {
+    const job = captionRequests.get(message.request_id);
+    const entry = videos.get(sender.tab.id);
+    if (!job || job.tab_id !== sender.tab.id || message.document_start !== job.document_start ||
+        !entry || entry.documentStart !== job.document_start || !sameCaptionVideo(entry.video, job.video) ||
+        !sameCaptionVideo(message.video, job.video)) return;
+    captionRequests.delete(job.id);
+    const base = {id: job.id, tab_id: job.tab_id, video: job.video, document_start: job.document_start};
+    if (message.status === "unavailable" || message.status === "error") {
+      await post("/v1/captions", {...base, status: message.status}).catch(() => {});
+      return;
+    }
+    if (message.status !== "ready" || !Array.isArray(message.cues) || !message.cues.length || message.cues.length > 20000) {
+      await post("/v1/captions", {...base, status: "error"}).catch(() => {});
+      return;
+    }
+    // Only public subtitle text/times are forwarded. Even a spoofed page event
+    // cannot smuggle its fetch headers, signed URLs or unrelated JSON fields.
+    const chunks = []; let chunk = [], size = 0;
+    try {
+      for (const raw of message.cues) {
+        if (!raw || typeof raw.text !== "string" || !raw.text.trim() || raw.text.length > 16000 ||
+            !Number.isFinite(raw.start) || !Number.isFinite(raw.end) || raw.start < 0 || raw.end <= raw.start || raw.end > 604800) {
+          throw new Error("invalid cue");
+        }
+        const cue = {start: raw.start, end: raw.end, text: raw.text,
+          source_language: String(raw.source_language || message.source_language || "").slice(0, 32),
+          subtitle_kind: raw.subtitle_kind === "asr" ? "asr" : "human"};
+        if (typeof raw.translation === "string" && raw.translation.trim() && raw.translation.length <= 16000) {
+          cue.translation = raw.translation; cue.target_language = String(raw.target_language || "").slice(0, 32);
+        }
+        if (Array.isArray(raw.words) && raw.words.length <= 1000) {
+          cue.words = raw.words.filter(w => w && typeof w.text === "string" && w.text.trim() && w.text.length <= 500 &&
+            Number.isFinite(w.start) && Number.isFinite(w.end) && raw.start <= w.start && w.start < w.end && w.end <= raw.end)
+            .map(w => ({text: w.text, start: w.start, end: w.end}));
+        }
+        const length = JSON.stringify(cue).length;
+        if (length > 70000) throw new Error("large cue");
+        if (chunk.length && (chunk.length >= 160 || size + length > 80000)) {chunks.push(chunk); chunk = []; size = 0;}
+        chunk.push(cue); size += length;
+      }
+      if (chunk.length) chunks.push(chunk);
+      if (chunks.length > 256) throw new Error("large track");
+      for (let i = 0; i < chunks.length; i++) {
+        const current = videos.get(job.tab_id);
+        if (!current || current.documentStart !== job.document_start || !sameCaptionVideo(current.video, job.video)) return;
+        const reply = await post("/v1/captions", {...base, status: "ready", part: i, part_count: chunks.length, cues: chunks[i],
+          source_language: String(message.source_language || "").slice(0, 32),
+          caption_source: ["youtube-human", "youtube-asr", "bilibili-human", "bilibili-asr"].includes(message.caption_source) ? message.caption_source : ""});
+        if (reply.accepted === false) return; // Stopped/replaced request: no remaining text uploads.
+      }
+    } catch (_) {
+      await post("/v1/captions", {...base, status: "error"}).catch(() => {});
+    }
+  }
+
   async function closeTab(tabId) {
     videos.delete(tabId);
+    for (const [id, job] of captionRequests) if (job.tab_id === tabId) captionRequests.delete(id);
     if (session) await post("/v1/closed", {tab_id: tabId, seq: nextSequence(tabId)}).catch(() => {});
   }
 
@@ -106,7 +193,9 @@
       const reply = await post("/v1/poll", {});
       connected = true;
       for (const job of reply.jobs || []) void translateJob(job);
+      for (const job of reply.caption_jobs || []) void captionJob(job);
       const now = Date.now();
+      for (const [id, job] of captionRequests) if (now - job.started > 15000) captionRequests.delete(id);
       for (const [tabId, entry] of videos) {
         if (now - entry.seen > 5000) { await closeTab(tabId); continue; }
         if (!entry.dirty) continue;
@@ -136,16 +225,17 @@
       if (chrome.runtime.getManifest().name !== "Trancy 桌面字幕连接器") return;
       api = dependencies;
       chrome.runtime.onMessage.addListener((message, sender) => {
-        if (message?.kind !== "trancy-desktop-report-v1" || sender.id !== chrome.runtime.id ||
+        if (!["trancy-desktop-report-v1", "trancy-desktop-captions-report-v1"].includes(message?.kind) || sender.id !== chrome.runtime.id ||
             sender.frameId !== 0 || !sender.tab || !pageIdentity(sender.tab.url) ||
             pageIdentity(message.href) !== pageIdentity(sender.tab.url)) return;
+        if (message.kind === "trancy-desktop-captions-report-v1") { void captionResult(message, sender); return; }
         const previous = reports.get(sender.tab.id);
         const docStart = Number(message.document_start), sequence = Number(message.sequence);
         if (!Number.isFinite(docStart) || !Number.isSafeInteger(sequence) ||
             (previous && (docStart < previous.documentStart || (docStart === previous.documentStart && sequence <= previous.sequence)))) return;
         reports.set(sender.tab.id, {documentStart: docStart, sequence});
         if (message.video === null) { void closeTab(sender.tab.id); return; }
-        const video = sanitizeVideo(message.video, sender);
+        const video = sanitizeVideo({...message.video, document_start: docStart}, sender);
         if (!video) return;
         videos.set(sender.tab.id, {video, documentStart: docStart, sequence, seen: Date.now(), dirty: true});
       });

@@ -63,7 +63,8 @@ class Timeline:
                     if field == "words" and not value and current.get("words"):
                         continue
                     current[field] = value
-        self._index()
+        if added:
+            self._index()
         return added
 
     def replace_job(self, job_id, cues):
@@ -93,8 +94,15 @@ class Timeline:
                 for field in ("translation", "source_language", "target_language"):
                     if field in cue:
                         current[field] = cue[field]
+                current.pop("translation_error", None)
                 updated.append(self._by_key[key])
         return updated
+
+    def translation_failed(self, cues, message):
+        for cue in clean_cues(cues):
+            current = self._by_key.get(cue_key(cue))
+            if current is not None and not current.get("translation"):
+                current["translation_error"] = str(message)[:400]
 
     def trim_before(self, position):
         self._by_key = {key: cue for key, cue in self._by_key.items() if cue["end"] >= position}
@@ -110,6 +118,10 @@ class Timeline:
                 break
             index -= 1
         return None
+
+    def near(self, position, limit=40):
+        index = max(0, bisect_right(self._starts, position) - 1)
+        return self.cues[max(0, index - 3):index + limit]
 
 
 def file_identity(path: str) -> str:
@@ -148,4 +160,44 @@ class CaptionCache:
         self.root.mkdir(parents=True, exist_ok=True)
         self._path(identity, model, translation_mode).write_text(
             json.dumps({"complete": True, "cues": cleaned}, ensure_ascii=False), encoding="utf-8")
+        return True
+
+    def _buffer_path(self, identity, model, translation_mode):
+        key = json.dumps([identity, model, translation_mode, "zh-en-buffer-v3"], ensure_ascii=False)
+        return self.root / (hashlib.sha256(key.encode("utf-8")).hexdigest() + ".json")
+
+    def read_bundle(self, identity, model, translation_mode):
+        """Resume recognized portions without requiring the whole film's translation."""
+        try:
+            path = self._buffer_path(identity, model, translation_mode)
+            if path.stat().st_size > 32 * 1024 * 1024:
+                return {}
+            value = json.loads(path.read_text(encoding="utf-8"))
+            if value.get("schema") != 3:
+                return {}
+            coverage = []
+            for start, end in value.get("coverage", []):
+                start, end = float(start), float(end)
+                if math.isfinite(start) and math.isfinite(end) and 0 <= start < end:
+                    coverage.append((start, end))
+            return dict(cues=clean_cues(value.get("cues")), coverage=coverage,
+                        duration=value.get("duration"), corpus_complete=bool(value.get("corpus_complete")),
+                        source_kind=value.get("source_kind", "asr"))
+        except (OSError, ValueError, KeyError, TypeError):
+            old = self.read(identity, model, translation_mode)
+            return dict(cues=old, coverage=[], corpus_complete=True, source_kind="asr") if old else {}
+
+    def write_bundle(self, identity, model, translation_mode, cues, *, coverage=(), duration=None,
+                     corpus_complete=False, source_kind="asr"):
+        cleaned = clean_cues(cues)
+        if not cleaned and not coverage:
+            return False
+        # Job IDs and error/queue status do not belong to a durable caption.
+        cleaned = [{k: v for k, v in cue.items() if not k.startswith("_") and k != "translation_error"}
+                   for cue in cleaned]
+        self.root.mkdir(parents=True, exist_ok=True)
+        self._buffer_path(identity, model, translation_mode).write_text(json.dumps(
+            dict(schema=3, cues=cleaned, coverage=list(coverage), duration=duration,
+                 corpus_complete=bool(corpus_complete), source_kind=source_kind), ensure_ascii=False),
+            encoding="utf-8")
         return True

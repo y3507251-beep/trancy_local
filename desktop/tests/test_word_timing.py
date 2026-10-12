@@ -99,7 +99,7 @@ class WordTimingTests(unittest.TestCase):
             with self.subTest(text=text, words=words), self.assertRaises(ValueError):
                 asr_worker.aligned_timed_cues(text, words)
 
-    def test_live_offset_shifts_sentence_and_words_once_without_mutation(self):
+    def test_source_offset_shifts_sentence_and_words_once_without_mutation(self):
         cue = dict(start=40.1, end=42, text="hello world", timing_source="qwen_aligner",
                    words=[dict(text="hello", start=40.1, end=40.7),
                           dict(text=" world", start=41.3, end=42)])

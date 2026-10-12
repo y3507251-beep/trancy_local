@@ -181,11 +181,27 @@ def own_process_tree():
     _JOB_HANDLE = handle  # Intentionally retained until process exit.
 
 
-def extract_audio(source: Path, destination: Path, check_cancel, on_progress, limit_seconds=None) -> dict:
-    """Decode any supported container to mono PCM, preserving gaps on its timeline."""
+def extract_audio(source: Path, destination: Path, check_cancel, on_progress, limit_seconds=None,
+                  *, start_seconds=0.0, duration_seconds=None) -> dict:
+    """Seek before decoding, and preserve gaps within the requested window.
+
+    The PCM and model timestamps start at zero for this window. The Qt
+    coordinator later adds its source start and optional source-clock offset.
+    Seeking avoids decoding the earlier part of a long video after a jump.
+    """
     import av
     import numpy as np
 
+    start_seconds = float(start_seconds)
+    duration_seconds = None if duration_seconds is None else float(duration_seconds)
+    if (not math.isfinite(start_seconds) or start_seconds < 0 or
+            duration_seconds is not None and (not math.isfinite(duration_seconds) or duration_seconds <= 0)):
+        raise ValueError("无效的音频读取窗口")
+    if limit_seconds is not None:
+        limit_seconds = float(limit_seconds)
+        if not math.isfinite(limit_seconds) or limit_seconds <= 0:
+            raise ValueError("无效的音频读取时长")
+        duration_seconds = min(duration_seconds, limit_seconds) if duration_seconds else limit_seconds
     rate, written, decoded = 16000, 0, 0
     last_event = 0.0
     silence = bytes(rate * 2)
@@ -194,15 +210,24 @@ def extract_audio(source: Path, destination: Path, check_cancel, on_progress, li
             raise ValueError("这个文件没有音频轨道，无法生成语音字幕")
         stream = container.streams.audio[0]
         origin = (container.start_time or 0) / av.time_base
-        duration = (container.duration or 0) / av.time_base
-        if not duration and stream.duration is not None:
-            duration = float(stream.duration * stream.time_base)
-        if not math.isfinite(duration) or duration < 0:
-            duration = 0
-        if limit_seconds:
-            duration = min(duration, limit_seconds) if duration else limit_seconds
+        source_duration = (container.duration or 0) / av.time_base
+        if not source_duration and stream.duration is not None:
+            source_duration = float(stream.duration * stream.time_base)
+        if not math.isfinite(source_duration) or source_duration < 0:
+            source_duration = 0
+        if source_duration and start_seconds >= source_duration:
+            raise ValueError("音频读取窗口已超出视频时长")
+        duration = max(0, source_duration - start_seconds) if source_duration else 0
+        if duration_seconds:
+            duration = min(duration, duration_seconds) if duration else duration_seconds
+        check_cancel()
+        if start_seconds:
+            # Global timestamps include the container origin. Decode the
+            # preceding keyframe if needed, but trim all pre-window samples.
+            container.seek(round((origin + start_seconds) * av.time_base), backward=True, any_frame=False)
+        check_cancel()
         resampler = av.AudioResampler(format="s16", layout="mono", rate=rate)
-        maximum = round(limit_seconds * rate) if limit_seconds else None
+        maximum = round(duration * rate) if duration else None
         with wave.open(str(destination), "wb") as output:
             output.setnchannels(1)
             output.setsampwidth(2)
@@ -212,8 +237,8 @@ def extract_audio(source: Path, destination: Path, check_cancel, on_progress, li
                 nonlocal written, last_event
                 check_cancel()
                 samples = frame.to_ndarray().reshape(-1).astype("<i2", copy=False)
-                target = round((frame.time - origin) * rate) if frame.time is not None else written
-                if duration and target / rate > duration + 60:
+                target = round((frame.time - origin - start_seconds) * rate) if frame.time is not None else written
+                if source_duration and target / rate + start_seconds > source_duration + 60:
                     raise ValueError("音频时间戳超出视频时长，不能安全生成对齐字幕")
                 # Container timestamps can be rounded to milliseconds (WMV/RMVB).
                 gap = target - written
@@ -250,8 +275,14 @@ def extract_audio(source: Path, destination: Path, check_cancel, on_progress, li
                     write_frame(item)
         if not decoded or not written:
             raise ValueError("音频轨道为空或无法解码")
-        on_progress(written / rate, duration)
-        return {"duration": max(duration, written / rate), "audio_duration": written / rate,
+        # Container duration can include a longer video track or be absent.
+        # Only these actually written samples were recognized. Do not mark
+        # an un-read tail of the requested window as covered by this job.
+        duration = written / rate
+        on_progress(duration, duration)
+        return {"duration": duration, "audio_duration": duration,
+                "source_duration": source_duration, "segment_start": start_seconds,
+                "segment_end": start_seconds + duration,
                 "codec": stream.codec_context.name, "sample_rate": rate}
 
 
@@ -308,8 +339,13 @@ class EngineBase:
                        indeterminate=not duration)
 
         self.state(status="extracting", progress=0, indeterminate=False, message="正在读取视频并提取音频")
-        media = extract_audio(source, audio, self.check, progress, request.get("test_limit_seconds"))
+        media = extract_audio(source, audio, self.check, progress, request.get("test_limit_seconds"),
+                              start_seconds=request.get("start_seconds", 0.0),
+                              duration_seconds=request.get("duration_seconds"))
         self.check()
+        self.state(status="extracting", progress=20, indeterminate=False,
+                   message="当前播放附近的音频提取完成" if request.get("duration_seconds") else "音频提取完成",
+                   **media)
         return audio, media, options
 
     def clear_job(self):
@@ -434,6 +470,7 @@ class WhisperEngine(EngineBase):
         job = self.manager.jobs["local"]
         cues = normalize_timed_cues(job["cues"], job["duration"])
         return dict(cues=cues, no_speech=not bool(cues), duration=job["duration"], model=self.model_name, device=self.device,
+                    **{key: media[key] for key in ("segment_start", "segment_end", "source_duration") if key in media},
                     detected_language=job.get("detected_language", ""), elapsed=round(time.monotonic() - started, 3),
                     worker_pid=os.getpid(), model_instance=self.instance_id, load_count=self.load_count)
 
@@ -563,6 +600,7 @@ class QwenEngine(EngineBase):
             cues, detected = self.recognize(audio, media, options, "cpu")
         self.check()
         return dict(cues=cues, no_speech=not bool(cues), duration=media["duration"], model=self.model_name, device=self.device,
+                    **{key: media[key] for key in ("segment_start", "segment_end", "source_duration") if key in media},
                     detected_language=detected, elapsed=round(time.monotonic() - started, 3),
                     worker_pid=os.getpid(), model_instance=self.instance_id, load_count=self.load_count)
 

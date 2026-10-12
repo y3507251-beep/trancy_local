@@ -44,7 +44,7 @@ def extractor_urls(video):
         if video["platform"] == "youtube" and info.get("id") != video["video_id"]:
             raise RuntimeError("YouTube 返回的视频编号与当前任务不一致")
         if info.get("is_live") or info.get("live_status") in {"is_live", "is_upcoming"}:
-            raise RuntimeError("正在进行或尚未开始的网页直播请使用系统声音实时字幕模式")
+            raise RuntimeError("当前版本暂不支持正在进行或尚未开始的网页直播")
         tracks = [f for f in info.get("formats", []) if f.get("vcodec") == "none"
                   and str(f.get("protocol", "https")) in {"http", "https"}
                   and allowed_url(f.get("url", ""), video["platform"])]
@@ -55,10 +55,10 @@ def extractor_urls(video):
             raise
         message = str(exc).lower()
         if any(x in message for x in ("sign in", "login", "private video", "members-only", "age-restricted")):
-            raise RuntimeError("YouTube 音频需要登录或访问授权；请在已登录网页播放后重试，或使用系统声音实时模式") from None
+            raise RuntimeError("YouTube 音频需要登录或访问授权；请在已登录网页播放后重试") from None
         if any(x in message for x in ("signature", "challenge", "nsig", "javascript runtime")):
-            raise RuntimeError("YouTube 音频签名解析失败；请更新 SubtitleService 的 yt-dlp，或使用系统声音实时模式") from None
-        raise RuntimeError("视频音频解析失败，可能是网络、站点限制或解析器版本；可使用系统声音实时模式") from None
+            raise RuntimeError("YouTube 音频签名解析失败；请更新 SubtitleService 的 yt-dlp 后重试") from None
+        raise RuntimeError("视频音频解析失败，请检查网络、站点访问状态或解析器版本后重试") from None
 
 
 def verify_audio(path: Path, expected: float):
@@ -159,7 +159,7 @@ def main():
             extra = client.extractor_audio(video) if client else extractor_urls(video)
             result = attempt_urls(extra)
         if not result:
-            raise RuntimeError("当前视频音频无法下载，可能已过期、需要登录或受站点限制；请在原网页播放后重试，或使用系统声音实时模式")
+            raise RuntimeError("当前视频音频无法下载，可能已过期、需要登录或受站点限制；请在原网页播放后重试")
         emit("progress", message="音频已下载并校验，正在准备语音识别")
         emit("result", path=str(result))
     finally:

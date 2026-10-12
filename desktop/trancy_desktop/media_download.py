@@ -41,7 +41,7 @@ class MediaDownloader(QObject):
             if clean["ad_playing"]:
                 raise ValueError("请等网页广告结束后再生成字幕")
             if clean["is_live"]:
-                raise ValueError("正在进行的网页直播请使用系统声音实时字幕模式")
+                raise ValueError("当前版本暂不支持正在进行的网页直播")
             if clean["platform"] == "bilibili" and not clean["cid"]:
                 raise ValueError("B 站当前分 P 的视频身份尚未准备完成，请在原网页播放后重试")
             directory = Path(output_dir).resolve()

@@ -49,9 +49,15 @@ class MemoryCache:
     def read(self, *unused):
         return []
 
+    def read_bundle(self, *unused):
+        return {}
+
     def write(self, *args):
         self.writes.append(args)
         return True
+
+    def write_bundle(self, *args, **unused):
+        return self.write(*args)
 
 
 class FakeOverlay(QObject):
@@ -112,57 +118,49 @@ class FakeASR(QObject):
         self.closed.emit()
 
 
-class FakeCapture(QObject):
-    chunk_ready = pyqtSignal(str, float, float)
-    level = pyqtSignal(float)
-    error = pyqtSignal(str)
-    stopped = pyqtSignal()
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.running = False
-        self.started = []
-        self.stop_count = 0
-
-    @staticmethod
-    def devices(): return []
-
-    def start(self, directory, **options):
-        if self.running:
-            self.error.emit("系统声音捕获正在运行，请先停止")
-            return
-        self.running = True
-        self.started.append(directory)
-
-    def stop(self):
-        self.stop_count += 1
-
-    def finish_stop(self):
-        self.running = False
-        self.stopped.emit()
 
 
 class FakeBridge(QObject):
     video_changed = pyqtSignal(dict)
     status_changed = pyqtSignal(str)
+    captions_ready = pyqtSignal(dict)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.items = []
+        self.caption_requests = []
+        self.caption_result = {"status": "unavailable", "cues": []}
+        self.cancelled_captions = []
 
     def videos(self): return list(self.items)
     def start(self, **unused): pass
     def stop(self): pass
+
+    def request_captions(self, video, generation=0):
+        request_id = str(len(self.caption_requests) + 1)
+        self.caption_requests.append((dict(video), generation, request_id))
+        if self.caption_result is not None:
+            self.captions_ready.emit(dict(self.caption_result, generation=generation, request_id=request_id,
+                                         bridge_key=controller.MainWindow._browser_tab(video),
+                                         key=video.get("key", ""), document_start=video.get("document_start", 0)))
+        return request_id
+
+    def cancel_captions(self, request_id):
+        self.cancelled_captions.append(request_id)
 
 
 class FakeTranslator(QObject):
     translated = pyqtSignal(dict)
     failed = pyqtSignal(dict)
     status = pyqtSignal(str)
+    closed = pyqtSignal()
 
     def __init__(self, bridge, parent=None):
         super().__init__(parent)
         self.jobs = []
+        self.windows = []
+        self.positions = []
+        self.is_closed = True
 
     def reset(self, generation):
         self.jobs.clear()
@@ -170,7 +168,34 @@ class FakeTranslator(QObject):
     def enqueue(self, *args, **kwargs):
         self.jobs.append((args, kwargs))
 
-    def shutdown(self): pass
+    def update_window(self, *args, **kwargs):
+        self.windows.append((args, kwargs))
+
+    def set_position(self, *args, **kwargs):
+        self.positions.append((args, kwargs))
+
+    def shutdown(self):
+        self.is_closed = True
+        self.closed.emit()
+
+
+class FakeNativeReader(QObject):
+    updated = pyqtSignal(dict)
+    finished = pyqtSignal()
+    result = {"event": "result", "status": "unavailable", "cues": []}
+
+    def __init__(self, source, job_id, **unused):
+        super().__init__()
+        self.source, self.job_id = source, job_id
+        self.cancelled = False
+
+    def start(self):
+        if self.result is not None:
+            self.updated.emit(dict(self.result, job_id=self.job_id))
+            self.finished.emit()
+
+    def cancel(self):
+        self.cancelled = True
 
 
 class FakePot(QObject):
@@ -225,13 +250,13 @@ class ControllerTests(unittest.TestCase):
         self.scheduled = deque()
         self.patches = [
             patch.object(controller, "ASRSession", FakeASR),
-            patch.object(controller, "SystemAudioCapture", FakeCapture),
             patch.object(controller, "BrowserBridge", FakeBridge),
             patch.object(controller, "TranslationQueue", FakeTranslator),
             patch.object(controller, "PotPlayerAdapter", FakePot),
             patch.object(controller, "MediaDownloader", FakeDownloader),
             patch.object(controller, "SubtitleOverlay", FakeOverlay),
             patch.object(controller, "CaptionCache", MemoryCache),
+            patch.object(controller, "NativeSubtitleReader", FakeNativeReader),
             patch.object(controller.MainWindow, "_setup_tray", lambda owner: setattr(owner, "tray", MagicMock())),
             patch.object(QTimer, "singleShot", lambda delay, callback: self.scheduled.append((delay, callback))),
             patch.object(Path, "mkdir"),
@@ -260,7 +285,7 @@ class ControllerTests(unittest.TestCase):
     def test_stale_asr_result_is_cleaned_without_rewriting_new_source(self):
         w = self.window
         w.generation, w.mode = 4, "potplayer"
-        old_source = str(controller.TEMP / "live-old" / "chunk.wav")
+        old_source = str(controller.TEMP / "asr-old" / "chunk.wav")
         w._active = {"job_id": "old", "generation": 3, "source": old_source, "temporary": True}
         w._asr_event({"event": "result", "job_id": "old", "cues": [{"start": 0, "end": 2, "text": "old"}]})
         self.assertEqual(w.timeline.cues, [])
@@ -283,55 +308,42 @@ class ControllerTests(unittest.TestCase):
         w._tick()
         self.assertEqual(w.overlay.last, ("", ""))
 
-    def test_old_live_chunk_is_not_assigned_to_new_capture_session(self):
-        w = self.window
-        w.start_live()
-        old = str(controller.TEMP / "live-previous-session" / "chunk.wav")
-        w._chunk_ready(old, 20, 24)
-        self.assertEqual(w.asr.requests, [], "An old-session WAV must not be transcribed in the new generation")
-        self.assertIn(old, self.recycled)
 
-    def test_live_restart_waits_for_old_capture_thread_to_finish(self):
-        w = self.window
-        w.start_live()
-        first = w.capture.started[-1]
-        w.start_live()
-        w.capture.finish_stop()
-        self.flush_scheduled()
-        self.assertEqual(w.mode, "live")
-        self.assertEqual(len(w.capture.started), 2)
-        self.assertNotEqual(first, w.capture.started[-1])
 
-    def test_synchronous_asr_error_is_terminal_instead_of_requeued(self):
+    def test_synchronous_asr_error_is_terminal_and_keeps_input_for_explicit_retry(self):
         w = self.window
         w._new_source("potplayer", "test", "test")
         w.asr.behavior = "synchronous_error"
         source = str(controller.TEMP / "web-test" / "audio.wav")
-        w._queue_file(source, temporary=True)
+        with patch.object(w, "_playback_clock", return_value=(0, True, 1)):
+            w._queue_file(source, temporary=True)
         self.assertIsNone(w._active)
         self.assertIsNone(w._pending_file, "A terminal validation error must not requeue a recycled source")
-        self.assertEqual(len(w._chunks), 0)
+        self.assertTrue(w._recognition_blocked)
+        self.assertNotIn(source, self.recycled)
+        w.stop()
         self.assertIn(source, self.recycled)
 
     def test_closing_still_cleans_matching_asr_terminal_input(self):
         w = self.window
-        source = str(controller.TEMP / "live-close" / "chunk.wav")
+        source = str(controller.TEMP / "asr-close" / "chunk.wav")
         w._active = {"job_id": "closing", "generation": w.generation, "source": source, "temporary": True}
         w._closing = True
         w._asr_event({"event": "cancelled", "job_id": "closing"})
         self.assertIsNone(w._active)
         self.assertIn(source, self.recycled)
 
-    def test_close_waits_for_capture_and_downloader_not_just_asr(self):
+    def test_close_waits_for_downloader_and_translation_not_just_asr(self):
         w = self.window
         w._closing, w._backend_closed = True, True
         w._close_started = time.monotonic()
-        w.capture.running = True
+        w.translator.is_closed = False
         w.downloader.running = True
         w._finish_close = MagicMock()
         w._tick()
         w._finish_close.assert_not_called()
-        w.capture.running = w.downloader.running = False
+        w.translator.is_closed = True
+        w.downloader.running = False
         w._tick()
         w._finish_close.assert_called_once()
 
@@ -376,7 +388,7 @@ class ControllerTests(unittest.TestCase):
 
     def test_active_asr_result_is_not_cached_under_new_model_selection(self):
         w = self.window
-        w.pot.state.update(connected=True, path=str(Path(__file__).resolve()), title="test-media")
+        w.pot.state.update(connected=True, path=str(Path(__file__).resolve()), title="test-media", position=0)
         w.start_potplayer()
         task = dict(w._active)
         w.model.setCurrentIndex(w.model.findData("large-v3"))
@@ -432,7 +444,7 @@ class ControllerTests(unittest.TestCase):
 
     def test_recycle_rejects_paths_outside_owned_temp_root(self):
         w = self.window
-        owned = str(controller.TEMP / "live-owned" / "chunk.wav")
+        owned = str(controller.TEMP / "asr-owned" / "chunk.wav")
         external = str(Path(__file__).resolve())
         class InlineThread:
             def __init__(self, target, **unused): self.target = target
@@ -441,17 +453,6 @@ class ControllerTests(unittest.TestCase):
             controller.MainWindow._recycle(w, [owned, external])
             recycle.assert_called_once_with([str(Path(owned).resolve())])
 
-    def test_live_chunk_preserves_all_sentences_and_their_translations(self):
-        w = self.window
-        w._new_source("live", "live-test", "test")
-        cues = [{"start": 4, "end": 5, "text": "Hello everyone.", "_job_id": "current"},
-                {"start": 5, "end": 8, "text": "Welcome to the test.", "_job_id": "current"}]
-        w.timeline.add([{"start": 0, "end": 3, "text": "Old chunk", "_job_id": "previous"}, *cues])
-        w._refresh_live_caption()
-        self.assertEqual(w._latest_live["text"], "Hello everyone. Welcome to the test.")
-        w._translated({"generation": w.generation,
-                       "cues": [{**cues[0], "translation": "大家好。"}, {**cues[1], "translation": "欢迎测试。"}]})
-        self.assertEqual(w._latest_live["translation"], "大家好。 欢迎测试。")
 
     def test_same_potplayer_cue_receives_each_new_playback_position(self):
         w = self.window
@@ -494,57 +495,159 @@ class ControllerTests(unittest.TestCase):
             w._tick()
         self.assertEqual(w.overlay.position, 1)
 
-    def test_live_combined_sentence_keeps_all_audio_word_metadata(self):
-        w = self.window
-        w._new_source("live", "live-test", "test")
-        first = {"start": 4, "end": 5, "text": "Hello everyone.", "_job_id": "current",
-                 "words": [{"start": 4.1, "end": 4.3, "text": "Hello"},
-                           {"start": 4.4, "end": 4.9, "text": "everyone."}]}
-        second = {"start": 5, "end": 8, "text": "Welcome to the test.", "_job_id": "current",
-                  "words": [{"start": 5.1, "end": 5.5, "text": "Welcome"},
-                            {"start": 5.6, "end": 5.9, "text": "to"},
-                            {"start": 6, "end": 6.1, "text": "the"},
-                            {"start": 6.2, "end": 6.6, "text": "test."}]}
-        w.timeline.add([first, second])
-        w._refresh_live_caption()
-        self.assertEqual(w._latest_live["words"], first["words"] + second["words"])
+    def test_only_video_source_tabs_remain(self):
+        self.assertEqual([self.window.tabs.tabText(i) for i in range(self.window.tabs.count())],
+                         ["PotPlayer", "B 站 / YouTube"])
 
-    def test_live_word_progress_replays_returned_chunk_on_a_delayed_clock(self):
+    def test_native_browser_subtitles_skip_audio_and_asr(self):
         w = self.window
-        w._new_source("live", "live-test", "test")
-        cue = {"start": 4, "end": 8, "text": "Hello everyone.", "translation": "大家好。",
-               "source_language": "en", "_job_id": "current"}
-        w.timeline.add([cue])
-        with patch.object(controller.time, "monotonic", return_value=100):
-            w._live_received = 100
-            w._refresh_live_caption()
-            w._tick()
-        self.assertEqual(w.overlay.position, 4,
-                         "ASR arrival starts delayed caption playback, not a claim to the current system-audio position")
-        with patch.object(controller.time, "monotonic", return_value=101.5):
-            w._tick()
-        self.assertAlmostEqual(w.overlay.position, 5.5)
-        with patch.object(controller.time, "monotonic", return_value=105):
-            w._tick()
-        self.assertEqual(w.overlay.position, 8)
+        cues = [{"start": 2, "end": 6, "text": "Hello everyone.", "source_language": "en",
+                 "words": [{"start": 2, "end": 3, "text": "Hello"}]}]
+        w.bridge.caption_result = {"status": "ready", "cues": cues, "source_language": "en"}
+        w._start_browser_video(video())
+        self.assertEqual(w.downloader.requests, [])
+        self.assertEqual(w.asr.requests, [])
+        self.assertEqual(w.timeline.cues[0]["words"], cues[0]["words"])
+        self.assertEqual(w.translator.windows[-1][0][2], 3)
+        w._tick()
+        self.assertEqual(w.overlay.last[0], "Hello everyone.")
 
-    def test_live_chinese_chunk_waits_for_english_translation_before_word_replay(self):
+    def test_potplayer_native_subtitles_skip_asr_and_reuse_platform_translation(self):
         w = self.window
-        w._new_source("live", "live-test", "test")
-        cue = {"start": 4, "end": 8, "text": "大家好。", "source_language": "zh", "_job_id": "current"}
+        w.pot.state.update(connected=True, path=str(Path(__file__).resolve()), position=3, duration=60, paused=True)
+        native = {"event": "result", "status": "ready", "cues": [
+            {"start": 2, "end": 6, "text": "Hello everyone.", "translation": "大家好。", "source_language": "en"}]}
+        with patch.object(FakeNativeReader, "result", native):
+            w.start_potplayer()
+        w._tick()
+        self.assertEqual(w.asr.requests, [])
+        self.assertEqual(w.overlay.last, ("Hello everyone.", "大家好。"))
+        self.assertEqual(w._native_readers, {})
+
+    def test_no_subtitles_start_near_current_position_instead_of_file_start(self):
+        w = self.window
+        w.pot.state.update(connected=True, path=str(Path(__file__).resolve()), position=400, duration=3600, paused=True)
+        w.start_potplayer()
+        options = w.asr.requests[-1][2]
+        self.assertEqual((options["start_seconds"], options["duration_seconds"]), (398, 12))
+        job = w._active["job_id"]
+        w._asr_event({"event": "result", "job_id": job, "cues": [], "segment_end": 410, "source_duration": 3600})
+        for _ in range(20):
+            w._tick()
+        self.assertEqual(len(w.asr.requests), 1, "Paused video with sufficient coverage must stop computing")
+
+    def test_seek_cancels_wrong_audio_window_and_prioritizes_new_position(self):
+        w = self.window
+        w.pot.state.update(connected=True, path=str(Path(__file__).resolve()), position=0, duration=3600, paused=True)
+        w.start_potplayer()
+        w._tick()
+        old_job = w._active["job_id"]
+        w.pot.state["position"] = 900
+        w._tick()
+        self.assertEqual(w.asr.cancel_count, 1)
+        w._asr_event({"event": "cancelled", "job_id": old_job})
+        w._tick()
+        self.assertEqual(w.asr.requests[-1][2]["start_seconds"], 898)
+        self.assertTrue(any(kwargs.get("seek") for _, kwargs in w.translator.positions))
+
+    def test_missing_or_disconnected_player_clock_does_not_recognize_from_zero(self):
+        w = self.window
+        source = str(Path(__file__).resolve())
+        w.pot.state.update(connected=True, path=source, position=None, duration=3600)
+        w.start_potplayer()
+        self.assertEqual(w.asr.requests, [])
+        w.pot.state.update(connected=False, position=200)
+        w._tick()
+        self.assertEqual(w.asr.requests, [])
+
+    def test_web_ad_after_download_does_not_start_recognition(self):
+        w = self.window
+        current = video()
+        w._start_browser_video(current)
+        public, directory = w.downloader.requests[-1]
+        w.downloader.running = False
+        w._last_video["ad_playing"] = True
+        w._downloaded(str(Path(directory) / "media-test" / "audio.wav"), public)
+        self.assertEqual(w.asr.requests, [])
+
+    def test_native_caption_timeout_falls_back_once_and_discards_late_ready(self):
+        w = self.window
+        w.bridge.caption_result = None
+        current = video()
+        w._start_browser_video(current)
+        request_id = w._caption_context["request_id"]
+        event = dict(generation=w.generation, request_id=request_id, document_start=0,
+                     bridge_key=w._bound_tab, status="timeout")
+        w._browser_captions(event)
+        w._browser_captions(dict(event, status="ready", cues=[{"start": 0, "end": 5, "text": "late"}]))
+        self.assertEqual(len(w.downloader.requests), 1)
+        self.assertEqual(w.timeline.cues, [])
+
+    def test_same_video_document_reload_restarts_caption_request_even_without_follow(self):
+        w = self.window
+        w.bridge.caption_result = None
+        first = dict(video(), document_start=100)
+        w._start_browser_video(first)
+        previous = dict(w._caption_context)
+        reloaded = dict(first, document_start=101)
+        w.bridge.items = [reloaded]
+        w._browser_update(reloaded)
+        self.assertEqual(len(w.bridge.caption_requests), 2)
+        self.assertIn(previous["request_id"], w.bridge.cancelled_captions)
+        w._browser_captions(dict(generation=w.generation, request_id=w._caption_context["request_id"],
+                                bridge_key=w._bound_tab, document_start=100, status="ready",
+                                cues=[{"start": 0, "end": 5, "text": "old document"}]))
+        self.assertEqual(w.timeline.cues, [])
+
+    def test_partial_recognition_cache_does_not_repeat_covered_audio(self):
+        w = self.window
+        bundle = dict(source_kind="asr", corpus_complete=False, duration=3600, coverage=[(100, 120)],
+                      cues=[{"start": 105, "end": 108, "text": "Hello", "translation": "你好"}])
+        w.pot.state.update(connected=True, path=str(Path(__file__).resolve()), position=110, duration=3600, paused=True)
+        with patch.object(w.cache, "read_bundle", side_effect=lambda _, model, __: bundle if model == "small" else {}):
+            w.start_potplayer()
+        self.assertEqual(w.asr.requests, [])
+        w.pot.state["position"] = 170
+        w._tick()
+        self.assertEqual(w.asr.requests[-1][2]["start_seconds"], 168)
+
+    def test_native_subtitle_reread_reuses_text_cache_without_reusing_old_times(self):
+        w = self.window
+        bundle = dict(source_kind="native", cues=[{"start": 0, "end": 3, "text": "Hello", "translation": "你好"}])
+        fresh = dict(event="result", cues=[{"start": 20, "end": 23, "text": "Hello"}])
+        w.pot.state.update(connected=True, path=str(Path(__file__).resolve()), position=21, duration=30, paused=True)
+        with patch.object(w.cache, "read_bundle", side_effect=lambda _, model, __: bundle if model == "native" else {}), patch.object(FakeNativeReader, "result", fresh):
+            w.start_potplayer()
+        self.assertEqual([(c["start"], c["translation"]) for c in w.timeline.cues], [(20, "你好")])
+        self.assertEqual(w.asr.requests, [])
+
+    def test_old_seek_translation_error_does_not_mark_current_caption_failed(self):
+        w = self.window
+        w.translator.epoch = 5
+        cue = {"start": 1, "end": 4, "text": "Hello"}
         w.timeline.add([cue])
-        with patch.object(controller.time, "monotonic", return_value=100):
-            w._live_received = 100
-            w._refresh_live_caption()
-            w._tick()
-        self.assertIsNone(w.overlay.position)
-        with patch.object(controller.time, "monotonic", return_value=102):
-            w._translated({"generation": w.generation, "cues": [{**cue, "translation": "Hello everyone."}]})
-            w._tick()
-        self.assertEqual(w.overlay.position, 4)
-        with patch.object(controller.time, "monotonic", return_value=103):
-            w._tick()
-        self.assertEqual(w.overlay.position, 5)
+        w._translation_error(dict(generation=w.generation, epoch=4, cues=[cue], message="old error"))
+        self.assertNotIn("translation_error", w.timeline.cues[0])
+        w._translation_error(dict(generation=w.generation, epoch=5, cues=[cue], message="current error"))
+        self.assertEqual(w.timeline.cues[0]["translation_error"], "current error")
+        w._translated(dict(generation=w.generation, epoch=5, cues=[dict(cue, translation="你好")]))
+        self.assertNotIn("translation_error", w.timeline.cues[0])
+
+    def test_stop_waits_to_recycle_audio_until_current_window_releases_it(self):
+        w = self.window
+        w._start_browser_video(video())
+        public, directory = w.downloader.requests[-1]
+        source = str(Path(directory) / "media-test" / "audio.wav")
+        w.downloader.running = False
+        w._downloaded(source, public)
+        job = w._active["job_id"]
+        w.stop()
+        self.assertNotIn(source, self.recycled)
+        w._asr_event({"event": "cancelled", "job_id": job})
+        self.assertIn(source, self.recycled)
+
+
+
 
 
 class TimelineIntegrationTests(unittest.TestCase):
@@ -602,12 +705,12 @@ class TimelineIntegrationTests(unittest.TestCase):
         self.assertEqual(timeline.at(1)["translation"], "你们好")
 
 
-def live_integration(source: str) -> dict:
+def player_integration(source: str) -> dict:
     """Opt-in real MainWindow -> PotPlayer -> SubtitleService -> Google test.
 
     The input must be a generated test WAV with at least four silent seconds at
     the beginning. Only a new, PID-verified PotPlayer instance is controlled.
-    SystemAudioCapture.start is never called. Artifacts and the input are kept.
+    Artifacts and the input are kept.
     """
     import ctypes
     from PyQt6.QtGui import QFont, QFontDatabase
@@ -641,7 +744,7 @@ def live_integration(source: str) -> dict:
     hwnd = None
     window = None
     report = {"source": str(media), "potplayer_pid": process.pid, "executable": executable,
-              "system_audio_recorded": False, "completed": False}
+              "completed": False}
 
     def spin(predicate, timeout, description):
         deadline = time.monotonic() + timeout
@@ -686,7 +789,7 @@ def live_integration(source: str) -> dict:
         window.asr.updated.connect(lambda event: events.append({k: v for k, v in event.items() if k in
                                      ("event", "status", "message", "model", "device", "detected_language")}))
         window.start_potplayer()
-        window.tabs.setCurrentIndex(1)
+        window.tabs.setCurrentIndex(0)
         spin(lambda: window._source_complete and len(window.timeline.cues) >= 2
              and all(cue.get("translation") for cue in window.timeline.cues), 300, "recognize and translate generated speech")
         report["asr_events"] = events
@@ -746,8 +849,8 @@ def live_integration(source: str) -> dict:
 
 
 if __name__ == "__main__":
-    if "--live-integration" in sys.argv:
-        fixture = sys.argv[sys.argv.index("--live-integration") + 1]
-        print(json.dumps(live_integration(fixture), ensure_ascii=False, indent=2), flush=True)
+    if "--player-integration" in sys.argv:
+        fixture = sys.argv[sys.argv.index("--player-integration") + 1]
+        print(json.dumps(player_integration(fixture), ensure_ascii=False, indent=2), flush=True)
     else:
         unittest.main()

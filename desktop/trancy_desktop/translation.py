@@ -11,9 +11,9 @@ import json
 import re
 import threading
 import time
-from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
-from urllib.request import Request, urlopen
+
+import requests
 
 
 class TranslationError(RuntimeError):
@@ -46,13 +46,30 @@ def _decode_entities(text: str) -> str:
 
 
 class TranslationClient:
-    def __init__(self, mode: str = "google", bridge=None, timeout: float = 30):
+    # Every worker has its own reusable connection, while rate limiting spans
+    # workers: four simultaneous requests must not become four startup bursts.
+    _google_rate_lock = threading.Lock()
+    _google_next_request = 0.0
+
+    def __init__(self, mode: str = "google", bridge=None, timeout: float | None = None):
         if mode not in {"google", "plugin"}:
             raise ValueError("翻译模式只支持 google 或 plugin")
-        self.mode, self.bridge, self.timeout = mode, bridge, timeout
+        self.mode, self.bridge = mode, bridge
+        self.timeout = timeout if timeout is not None else (10 if mode == "google" else 30)
         self._cache: OrderedDict[tuple[str, str, str], str] = OrderedDict()
         self._lock = threading.Lock()
-        self._next_request = 0.0
+        self._session = requests.Session()
+
+    def close(self):
+        self._session.close()
+
+    @classmethod
+    def _wait_google_slot(cls):
+        with cls._google_rate_lock:
+            delay = cls._google_next_request - time.monotonic()
+            if delay > 0:
+                time.sleep(delay)
+            cls._google_next_request = time.monotonic() + .15
 
     def translate(self, texts: list[str], source: str, target: str) -> list[str]:
         if not texts:
@@ -74,10 +91,7 @@ class TranslationClient:
             missing = list(dict.fromkeys(t for t in texts if t.strip() and
                                        (source, target, t) not in self._cache))
             for batch in self._batches(missing):
-                delay = self._next_request - time.monotonic()
-                if delay > 0:
-                    time.sleep(delay)
-                self._next_request = time.monotonic() + .15
+                self._wait_google_slot()
                 translated = self._google(batch, source, target)
                 for original, translation in zip(batch, translated):
                     self._cache[source, target, original] = translation
@@ -90,7 +104,7 @@ class TranslationClient:
     def _batches(texts):
         batch, size = [], 0
         for text in texts:
-            if batch and (len(batch) >= 20 or size + len(text) > 3000):
+            if batch and (len(batch) >= 30 or size + len(text) > 3000):
                 yield batch
                 batch, size = [], 0
             batch.append(text)
@@ -101,15 +115,20 @@ class TranslationClient:
     def _google(self, texts: list[str], source: str, target: str) -> list[str]:
         query = urlencode({"client": "gtx", "dt": "t", "format": "html", "sl": source, "tl": target})
         body = urlencode([("q", re.sub(r"\s+", " ", text).strip()) for text in texts]).encode("utf-8")
-        request = Request("https://translate.googleapis.com/translate_a/t?" + query,
-                          data=body, method="POST",
-                          headers={"Content-Type": "application/x-www-form-urlencoded"})
         try:
-            with urlopen(request, timeout=self.timeout) as response:
-                payload = json.loads(response.read(2_000_000))
-        except HTTPError as error:
-            raise TranslationError(f"Google 翻译接口返回 HTTP {error.code}，请稍后重试或切换插件引擎") from None
-        except (URLError, TimeoutError, OSError):
+            with self._session.post("https://translate.googleapis.com/translate_a/t?" + query,
+                                    data=body, timeout=self.timeout, stream=True,
+                                    headers={"Content-Type": "application/x-www-form-urlencoded"}) as response:
+                if not response.ok:
+                    raise TranslationError(f"Google 翻译接口返回 HTTP {response.status_code}，请稍后重试或切换插件引擎")
+                chunks, size = [], 0
+                for chunk in response.iter_content(65536):
+                    size += len(chunk)
+                    if size > 2_000_000:
+                        raise TranslationError("Google 翻译接口返回的数据过大")
+                    chunks.append(chunk)
+                payload = json.loads(b"".join(chunks))
+        except (requests.RequestException, TimeoutError, OSError):
             raise TranslationError("Google 翻译连接失败，请检查网络或切换插件引擎") from None
         except (ValueError, UnicodeError):
             raise TranslationError("Google 翻译接口返回的数据无法解析") from None
