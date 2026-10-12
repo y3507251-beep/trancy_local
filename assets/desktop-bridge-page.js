@@ -15,6 +15,13 @@
   const siteFetch = window.fetch;
   let sequence = 0;
   let requestSequence = 0;
+  let dubbingLease = null;
+  let watchedVideo = null;
+  const retiredDubbingLeases = new Set();
+  const playbackEvents = ["play", "pause", "ended", "seeking", "seeked", "waiting", "stalled", "playing", "ratechange", "loadedmetadata", "emptied"];
+  const playbackHandlers = new Map();
+  let waitingForPlayback = false;
+  let seekSerial = 0;
 
   function pageIdentity(href = location.href) {
     try {
@@ -562,20 +569,144 @@
     }
     if (captured?.cid === cid) audio = [...new Set([...captured.audio, ...audio])];
     if (!/^[1-9][0-9]{0,19}$/.test(cid)) cid = "";
+    const advert = document.querySelector(".bpx-player-ad-tip, .bilibili-player-video-ad");
     return {...identity, video, cid, title: state?.bvid === identity.video_id ? state.title : document.title,
-      audio_urls: audio.slice(0, 12), ad_playing: false, is_live: false};
+      audio_urls: audio.slice(0, 12), ad_playing: Boolean(advert?.offsetParent), is_live: false};
   }
 
-  function report() {
+  function dubbingIdentity(found) {
+    return {platform: found.platform, video_id: found.video_id, url: found.url, page: found.page, cid: found.cid};
+  }
+
+  function dubbingReport(lease, status, reason = "") {
+    const video = lease.video;
+    window.postMessage({kind: "trancy-desktop-dubbing-v1", document_start: docStart,
+      sequence: ++sequence, href: location.href, request_id: lease.request_id,
+      lease_id: lease.lease_id, video: lease.identity, status, reason,
+      position: Number.isFinite(video?.currentTime) ? video.currentTime : 0,
+      paused: Boolean(video?.paused || video?.ended), rate: Number(video?.playbackRate) || 1,
+      seeking: Boolean(video?.seeking), buffering: Boolean(waitingForPlayback || video?.readyState < 3),
+      seek_serial: seekSerial}, location.origin);
+  }
+
+  function retireDubbing(leaseId) {
+    retiredDubbingLeases.add(leaseId);
+    while (retiredDubbingLeases.size > 64) retiredDubbingLeases.delete(retiredDubbingLeases.values().next().value);
+  }
+
+  function restoreDubbing(status = "restored", reason = "disabled", userOverride = false) {
+    const lease = dubbingLease;
+    if (!lease) return;
+    dubbingLease = null;
+    clearTimeout(lease.timer);
+    retireDubbing(lease.lease_id);
+    // We own only the temporary mute. Volume is never changed by the bridge.
+    // A user unmute is left intact; a volume-only edit keeps their new volume
+    // while removing our temporary mute before relinquishing control.
+    if (lease.video.muted === true && (!userOverride || lease.video.volume !== lease.volume)) {
+      lease.video.muted = lease.muted;
+    }
+    dubbingReport(lease, status, reason);
+  }
+
+  function checkDubbing(found) {
+    if (!dubbingLease) return;
+    if (!found || found.video !== dubbingLease.video || nativeIdentity(found) !== nativeIdentity(dubbingLease.identity)) {
+      restoreDubbing("video_changed", "video_changed");
+    } else if (Date.now() >= dubbingLease.expires) {
+      restoreDubbing("expired", "lease_expired");
+    } else if (found.ad_playing) {
+      restoreDubbing("restored", "ad_playing");
+    }
+  }
+
+  window.addEventListener("message", event => {
+    const message = event.data;
+    if (event.source !== window || event.origin !== location.origin || message?.kind !== "trancy-desktop-dubbing-command-v1" ||
+        message.document_start !== docStart || !/^[a-f0-9]{32}$/.test(message.request_id || "") ||
+        !/^[a-f0-9]{32}$/.test(message.lease_id || "") || typeof message.enabled !== "boolean" ||
+        message.video?.platform !== "bilibili") return;
+    const identity = pageIdentity(), found = identity && currentVideo(identity);
+    const requested = {request_id: message.request_id, lease_id: message.lease_id, identity: message.video, video: found?.video};
+    if (!message.enabled) {
+      if (dubbingLease?.lease_id === message.lease_id && nativeIdentity(dubbingLease.identity) === nativeIdentity(message.video)) {
+        dubbingLease.request_id = message.request_id;
+        restoreDubbing("restored", message.reason === "bridge_disconnected" ? "bridge_disconnected" : "disabled");
+      } else {
+        retireDubbing(message.lease_id);
+        dubbingReport(requested, "restored", "disabled");
+      }
+      return;
+    }
+    if (!found || found.platform !== "bilibili" || !found.cid || nativeIdentity(found) !== nativeIdentity(message.video) || found.ad_playing) {
+      dubbingReport(requested, "error", found?.ad_playing ? "ad_playing" : "video_changed");
+      return;
+    }
+    if (retiredDubbingLeases.has(message.lease_id)) {
+      dubbingReport(requested, "error", "retired_lease");
+      return;
+    }
+    if (dubbingLease && (dubbingLease.lease_id !== message.lease_id || dubbingLease.video !== found.video)) {
+      restoreDubbing("restored", "replaced");
+    }
+    if (!dubbingLease) {
+      dubbingLease = {...requested, identity: dubbingIdentity(found), muted: found.video.muted === true,
+        volume: Number(found.video.volume), timer: null};
+      found.video.muted = true;
+    }
+    dubbingLease.request_id = message.request_id;
+    dubbingLease.expires = Date.now() + 3000;
+    clearTimeout(dubbingLease.timer);
+    const leaseId = dubbingLease.lease_id;
+    dubbingLease.timer = setTimeout(() => {
+      if (dubbingLease?.lease_id === leaseId) restoreDubbing("expired", "lease_expired");
+    }, 3000);
+    dubbingReport(dubbingLease, "active");
+  });
+
+  function watchPlayback(video) {
+    if (watchedVideo === video) return;
+    if (watchedVideo) {
+      for (const [kind, handler] of playbackHandlers) watchedVideo.removeEventListener?.(kind, handler);
+    }
+    playbackHandlers.clear();
+    watchedVideo = video;
+    waitingForPlayback = false;
+    if (!video?.addEventListener) return;
+    for (const kind of playbackEvents) {
+      const handler = () => {
+        if (kind === "seeking") seekSerial++;
+        if (["waiting", "stalled", "emptied"].includes(kind)) waitingForPlayback = true;
+        if (["playing", "loadedmetadata"].includes(kind)) waitingForPlayback = false;
+        report(kind);
+      };
+      playbackHandlers.set(kind, handler);
+      video.addEventListener(kind, handler);
+    }
+    const volumeHandler = () => {
+      if (dubbingLease?.video === video && (video.muted !== true || Number(video.volume) !== dubbingLease.volume)) {
+        restoreDubbing("user_override", "user_volume", true);
+      }
+    };
+    playbackHandlers.set("volumechange", volumeHandler);
+    video.addEventListener("volumechange", volumeHandler);
+  }
+
+  function report(playbackEvent = "") {
     let data = null;
     try {
       const identity = pageIdentity();
       const found = identity && currentVideo(identity);
+      checkDubbing(found);
+      watchPlayback(found?.video || null);
       if (found) {
         const {video, ...metadata} = found;
         data = {...metadata, position: Number.isFinite(video.currentTime) ? video.currentTime : 0,
           duration: Number.isFinite(video.duration) ? video.duration : 0,
           paused: video.paused || video.ended || video.readyState < 2, rate: video.playbackRate,
+          seeking: Boolean(video.seeking), buffering: Boolean(waitingForPlayback || video.readyState < 3),
+          seek_serial: seekSerial, dubbing_protocol: 1,
+          playback_event: playbackEvents.includes(playbackEvent) ? playbackEvent : "",
           active: document.visibilityState === "visible"};
       }
       const currentKey = found ? nativeIdentity(found) : "";
@@ -585,6 +716,7 @@
       href: location.href, video: data}, location.origin);
   }
   window.addEventListener("pagehide", () => {
+    restoreDubbing("restored", "page_closed");
     for (const request of captionRequests.values()) request.controller.abort();
     window.postMessage({kind: MESSAGE, document_start: docStart,
       sequence: ++sequence, href: location.href, video: null}, location.origin);

@@ -124,6 +124,7 @@ class FakeBridge(QObject):
     video_changed = pyqtSignal(dict)
     status_changed = pyqtSignal(str)
     captions_ready = pyqtSignal(dict)
+    dubbing_changed = pyqtSignal(dict)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -131,10 +132,11 @@ class FakeBridge(QObject):
         self.caption_requests = []
         self.caption_result = {"status": "unavailable", "native_track_available": False, "cues": []}
         self.cancelled_captions = []
+        self.stop_count = 0
 
     def videos(self): return list(self.items)
     def start(self, **unused): pass
-    def stop(self): pass
+    def stop(self): self.stop_count += 1
 
     def request_captions(self, video, generation=0):
         request_id = str(len(self.caption_requests) + 1)
@@ -147,6 +149,27 @@ class FakeBridge(QObject):
 
     def cancel_captions(self, request_id):
         self.cancelled_captions.append(request_id)
+
+
+class FakeDubbing(QObject):
+    status = pyqtSignal(str)
+    disabled = pyqtSignal(str)
+    closed = pyqtSignal()
+
+    def __init__(self, bridge, parent=None):
+        super().__init__(parent)
+        self.enabled = False
+        self.is_closed = False
+        self.sources, self.corpus, self.ticks = [], [], []
+        self.stop_count = 0
+        self.shutdown_called = False
+
+    def set_enabled(self, value): self.enabled = value
+    def set_source(self, generation, video): self.sources.append((generation, video))
+    def set_cues(self, generation, cues): self.corpus.append((generation, list(cues)))
+    def tick(self, *args): self.ticks.append(args)
+    def stop(self): self.stop_count += 1
+    def shutdown(self): self.shutdown_called = True
 
 
 class FakeTranslator(QObject):
@@ -498,6 +521,50 @@ class ControllerTests(unittest.TestCase):
     def test_only_video_source_tabs_remain(self):
         self.assertEqual([self.window.tabs.tabText(i) for i in range(self.window.tabs.count())],
                          ["PotPlayer", "B 站 / YouTube"])
+
+    def test_english_dubbing_starts_disabled_and_has_no_speech_backend(self):
+        w = self.window
+        self.assertFalse(w.english_dubbing.isChecked())
+        self.assertIsNone(w._dubbing)
+        w.bridge.caption_result = {"status": "ready", "cues": [{"start": 0, "end": 5, "text": "Native"}]}
+        w._start_browser_video(video())
+        w._tick()
+        self.assertIsNone(w._dubbing)
+        self.assertEqual(w.asr.requests, [])
+
+    def test_dubbing_checkbox_creates_backend_only_after_opt_in_and_shares_captions(self):
+        from trancy_desktop import dubbing
+        w = self.window
+        current = dict(video(), platform="bilibili", video_id="BV1xx411c7mD", cid="12345",
+                       url="https://www.bilibili.com/video/BV1xx411c7mD/?p=1")
+        w.bridge.caption_result = {"status": "ready", "cues": [{"start": 0, "end": 5, "text": "Native"}]}
+        w._start_browser_video(current)
+        with patch.object(dubbing, "DubbingSession", FakeDubbing):
+            w.english_dubbing.setChecked(True)
+        self.assertTrue(w._dubbing.enabled)
+        self.assertEqual(w._dubbing.sources[-1][1]["cid"], "12345")
+        self.assertEqual(w._dubbing.corpus[-1][1][0]["text"], "Native")
+        w._tick()
+        self.assertTrue(w._dubbing.ticks)
+        w.english_dubbing.setChecked(False)
+        self.assertFalse(w._dubbing.enabled)
+        w.stop()
+        self.assertGreater(w._dubbing.stop_count, 0)
+
+    def test_close_keeps_browser_bridge_until_dubbing_restore_is_finished(self):
+        from trancy_desktop import dubbing
+        w = self.window
+        with patch.object(dubbing, "DubbingSession", FakeDubbing):
+            w.english_dubbing.setChecked(True)
+        with patch.object(w, "_finish_close") as finished:
+            w.closeEvent(MagicMock())
+            self.assertTrue(w._dubbing.shutdown_called)
+            self.assertEqual(w.bridge.stop_count, 0)
+            self.assertFalse(finished.called)
+            w._dubbing.is_closed = True
+            w._dubbing.closed.emit()
+            self.assertEqual(w.bridge.stop_count, 1)
+            self.assertTrue(finished.called)
 
     def test_native_browser_subtitles_skip_audio_and_asr(self):
         w = self.window

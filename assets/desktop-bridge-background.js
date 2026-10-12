@@ -8,6 +8,10 @@
   const tabSequences = new Map();
   const running = new Set();
   const captionRequests = new Map();
+  const dubbingRequests = new Map();
+  const dubbingLeases = new Map();
+  const dubbingStatuses = new Set(["active", "restored", "user_override", "expired", "video_changed", "error"]);
+  const dubbingReasons = new Set(["", "disabled", "bridge_disconnected", "lease_expired", "video_changed", "ad_playing", "retired_lease", "replaced", "user_volume", "page_closed", "observer_unavailable"]);
   const captionErrorCodes = new Set(["bili_metadata_failed", "bili_track_failed", "youtube_metadata_failed", "youtube_track_failed",
     "observer_unavailable", "video_changed", "invalid_caption_payload", "bridge_upload_failed"]);
   const clientId = crypto.randomUUID();
@@ -53,6 +57,10 @@
       duration: Number(raw.duration) || 0, rate: Number(raw.rate) || 1, paused: Boolean(raw.paused),
       active: Boolean(sender.tab.active && raw.active), ad_playing: Boolean(raw.ad_playing),
       is_live: Boolean(raw.is_live),
+      seeking: Boolean(raw.seeking), buffering: Boolean(raw.buffering),
+      seek_serial: Number.isSafeInteger(raw.seek_serial) && raw.seek_serial >= 0 ? raw.seek_serial : 0,
+      dubbing_protocol: raw.dubbing_protocol === 1 ? 1 : 0,
+      playback_event: ["play", "pause", "ended", "seeking", "seeked", "waiting", "stalled", "playing", "ratechange", "loadedmetadata", "emptied"].includes(raw.playback_event) ? raw.playback_event : "",
       document_start: Number(raw.document_start) || 0,
       audio_urls: urls.filter(u => typeof u === "string" && u.length <= 16384 && mediaAllowed(u, raw.platform, cid)).slice(0, 12)};
   }
@@ -95,6 +103,74 @@
     return left && right && pageIdentity(left.url) === pageIdentity(right.url) &&
       left.platform === right.platform && left.video_id === right.video_id &&
       Number(left.page) === Number(right.page) && String(left.cid || "") === String(right.cid || "");
+  }
+
+  async function dubbingJob(job) {
+    if (!job || !/^[a-f0-9]{32}$/.test(job.id || "") || !/^[a-f0-9]{32}$/.test(job.lease_id || "") ||
+        typeof job.enabled !== "boolean" || !Number.isSafeInteger(job.tab_id) || job.video?.platform !== "bilibili" ||
+        dubbingRequests.has(job.id)) return;
+    const entry = videos.get(job.tab_id);
+    if (job.enabled && (!entry || entry.video.dubbing_protocol !== 1 || !sameCaptionVideo(entry.video, job.video) ||
+        entry.documentStart !== job.document_start)) {
+      await post("/v1/dubbing", {id: job.id, tab_id: job.tab_id, video: job.video,
+        document_start: job.document_start, lease_id: job.lease_id, status: "error", reason: "video_changed"}).catch(() => {});
+      return;
+    }
+    dubbingRequests.set(job.id, {...job, started: Date.now()});
+    dubbingLeases.set(job.lease_id, {...job, started: Date.now()});
+    try {
+      const reply = await chrome.tabs.sendMessage(job.tab_id, {to: [], kind: "trancy-desktop-dubbing-request-v1",
+        request_id: job.id, lease_id: job.lease_id, document_start: job.document_start, video: job.video,
+        enabled: job.enabled}, {frameId: 0});
+      if (!reply?.accepted) throw new Error("dubbing observer unavailable");
+    } catch (_) {
+      dubbingRequests.delete(job.id);
+      dubbingLeases.delete(job.lease_id);
+      await post("/v1/dubbing", {id: job.id, tab_id: job.tab_id, video: job.video,
+        document_start: job.document_start, lease_id: job.lease_id, status: "error", reason: "observer_unavailable"}).catch(() => {});
+    }
+  }
+
+  async function dubbingResult(message, sender) {
+    const lease = dubbingLeases.get(message.lease_id), request = dubbingRequests.get(message.request_id);
+    const entry = videos.get(sender.tab.id);
+    if (!lease || lease.tab_id !== sender.tab.id || message.document_start !== lease.document_start ||
+        !sameCaptionVideo(message.video, lease.video) || !dubbingStatuses.has(message.status) ||
+        !/^[a-f0-9]{32}$/.test(message.request_id || "")) return;
+    if (message.status === "active" && (!request || !request.enabled || !entry ||
+        entry.documentStart !== lease.document_start || !sameCaptionVideo(entry.video, lease.video))) return;
+    dubbingRequests.delete(message.request_id);
+    if (message.status !== "active") {
+      dubbingLeases.delete(message.lease_id);
+      for (const [id, job] of dubbingRequests) if (job.lease_id === message.lease_id) dubbingRequests.delete(id);
+    }
+    await post("/v1/dubbing", {id: message.request_id, tab_id: lease.tab_id, video: lease.video,
+      document_start: lease.document_start, lease_id: lease.lease_id, status: message.status,
+      reason: dubbingReasons.has(message.reason) ? message.reason : "",
+      position: Math.max(0, Math.min(604800, Number(message.position) || 0)), paused: Boolean(message.paused),
+      rate: Math.max(.1, Math.min(16, Number(message.rate) || 1)), seeking: Boolean(message.seeking),
+      buffering: Boolean(message.buffering),
+      seek_serial: Number.isSafeInteger(message.seek_serial) && message.seek_serial >= 0 ? message.seek_serial : 0}).catch(() => {});
+  }
+
+  function releaseDubbing(tabId = null) {
+    for (const [leaseId, lease] of dubbingLeases) {
+      if (tabId !== null && lease.tab_id !== tabId) continue;
+      dubbingLeases.delete(leaseId);
+      for (const [id, job] of dubbingRequests) if (job.lease_id === leaseId) dubbingRequests.delete(id);
+      // Best effort immediate release; the page's independent 3-second lease
+      // also works when this worker, Chrome or the desktop process disappears.
+      void chrome.tabs.sendMessage(lease.tab_id, {to: [], kind: "trancy-desktop-dubbing-request-v1",
+        request_id: crypto.randomUUID().replaceAll("-", ""), lease_id: leaseId,
+        document_start: lease.document_start, video: lease.video, enabled: false,
+        reason: "bridge_disconnected"}, {frameId: 0}).catch(() => {});
+    }
+  }
+
+  async function publishVideo(tabId, entry) {
+    if (!session || videos.get(tabId) !== entry) return;
+    entry.dirty = false;
+    await post("/v1/video", {tab_id: tabId, seq: nextSequence(tabId), video: entry.video});
   }
 
   async function captionJob(job) {
@@ -181,6 +257,7 @@
   }
 
   async function closeTab(tabId) {
+    releaseDubbing(tabId);
     videos.delete(tabId);
     for (const [id, job] of captionRequests) if (job.tab_id === tabId) captionRequests.delete(id);
     if (session) await post("/v1/closed", {tab_id: tabId, seq: nextSequence(tabId)}).catch(() => {});
@@ -201,13 +278,14 @@
       connected = true;
       for (const job of reply.jobs || []) void translateJob(job);
       for (const job of reply.caption_jobs || []) void captionJob(job);
+      for (const job of reply.dubbing_jobs || []) void dubbingJob(job);
       const now = Date.now();
       for (const [id, job] of captionRequests) if (now - job.started > 15000) captionRequests.delete(id);
+      for (const [id, job] of dubbingRequests) if (now - job.started > 5000) dubbingRequests.delete(id);
       for (const [tabId, entry] of videos) {
         if (now - entry.seen > 5000) { await closeTab(tabId); continue; }
         if (!entry.dirty) continue;
-        entry.dirty = false;
-        await post("/v1/video", {tab_id: tabId, seq: nextSequence(tabId), video: entry.video});
+        await publishVideo(tabId, entry);
       }
       if (now - lastKeepalive > 20000) {
         lastKeepalive = now;
@@ -216,6 +294,7 @@
         await chrome.runtime.getPlatformInfo();
       }
     } catch (_) {
+      releaseDubbing();
       session = "";
       for (const entry of videos.values()) entry.dirty = true;
     } finally {
@@ -232,10 +311,11 @@
       if (chrome.runtime.getManifest().name !== "Trancy 桌面字幕连接器") return;
       api = dependencies;
       chrome.runtime.onMessage.addListener((message, sender) => {
-        if (!["trancy-desktop-report-v1", "trancy-desktop-captions-report-v1"].includes(message?.kind) || sender.id !== chrome.runtime.id ||
+        if (!["trancy-desktop-report-v1", "trancy-desktop-captions-report-v1", "trancy-desktop-dubbing-report-v1"].includes(message?.kind) || sender.id !== chrome.runtime.id ||
             sender.frameId !== 0 || !sender.tab || !pageIdentity(sender.tab.url) ||
             pageIdentity(message.href) !== pageIdentity(sender.tab.url)) return;
         if (message.kind === "trancy-desktop-captions-report-v1") { void captionResult(message, sender); return; }
+        if (message.kind === "trancy-desktop-dubbing-report-v1") { void dubbingResult(message, sender); return; }
         const previous = reports.get(sender.tab.id);
         const docStart = Number(message.document_start), sequence = Number(message.sequence);
         if (!Number.isFinite(docStart) || !Number.isSafeInteger(sequence) ||
@@ -244,7 +324,11 @@
         if (message.video === null) { void closeTab(sender.tab.id); return; }
         const video = sanitizeVideo({...message.video, document_start: docStart}, sender);
         if (!video) return;
-        videos.set(sender.tab.id, {video, documentStart: docStart, sequence, seen: Date.now(), dirty: true});
+        const priorVideo = videos.get(sender.tab.id);
+        if (priorVideo && (priorVideo.documentStart !== docStart || !sameCaptionVideo(priorVideo.video, video))) releaseDubbing(sender.tab.id);
+        const entry = {video, documentStart: docStart, sequence, seen: Date.now(), dirty: true};
+        videos.set(sender.tab.id, entry);
+        if (video.playback_event) void publishVideo(sender.tab.id, entry).catch(() => {releaseDubbing(); session = "";});
       });
       chrome.tabs.onRemoved.addListener(tabId => { reports.delete(tabId); void closeTab(tabId); });
       chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {

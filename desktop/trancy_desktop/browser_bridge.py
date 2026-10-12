@@ -27,6 +27,12 @@ CAPTION_ERROR_CODES = frozenset({
     "bili_metadata_failed", "bili_track_failed", "youtube_metadata_failed", "youtube_track_failed",
     "observer_unavailable", "video_changed", "invalid_caption_payload", "bridge_upload_failed",
 })
+DUBBING_STATUSES = frozenset({"active", "restored", "user_override", "expired", "video_changed", "error"})
+DUBBING_REASONS = frozenset({"", "disabled", "bridge_disconnected", "lease_expired", "video_changed",
+                           "ad_playing", "retired_lease", "replaced", "user_volume", "page_closed",
+                           "observer_unavailable", "request_timeout"})
+PLAYBACK_EVENTS = frozenset({"play", "pause", "ended", "seeking", "seeked", "waiting", "stalled",
+                           "playing", "ratechange", "loadedmetadata", "emptied"})
 
 
 def extension_id() -> str:
@@ -102,6 +108,10 @@ def normalize_video(raw: dict) -> dict:
              "paused": bool(raw.get("paused", True)), "rate": finite("rate", 1, .1, 16),
              "active": bool(raw.get("active", False)), "ad_playing": bool(raw.get("ad_playing", False)),
              "is_live": bool(raw.get("is_live", False)),
+             "seeking": bool(raw.get("seeking", False)), "buffering": bool(raw.get("buffering", False)),
+             "seek_serial": int(finite("seek_serial", 0, 0, 2147483647)),
+             "dubbing_protocol": 1 if type(raw.get("dubbing_protocol")) is int and raw["dubbing_protocol"] == 1 else 0,
+             "playback_event": raw.get("playback_event") if isinstance(raw.get("playback_event"), str) and raw["playback_event"] in PLAYBACK_EVENTS else "",
              "document_start": finite("document_start", 0, 0, 1e16),
              "audio_urls": audio}
     if platform == "bilibili":
@@ -157,6 +167,7 @@ class BrowserBridge(QObject):
     video_changed = pyqtSignal(dict)
     status_changed = pyqtSignal(str)
     captions_ready = pyqtSignal(dict)
+    dubbing_changed = pyqtSignal(dict)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -168,6 +179,8 @@ class BrowserBridge(QObject):
         self._sequences = {}
         self._jobs = {}
         self._caption_jobs = {}
+        self._dubbing_jobs = {}
+        self._dubbing_leases = {}
         self._extension_id = extension_id()
 
     def start(self, port: int = 18766):
@@ -270,6 +283,10 @@ class BrowserBridge(QObject):
             for job in self._caption_jobs.values():
                 job["timer"].cancel()
             self._caption_jobs.clear()
+            for job in self._dubbing_jobs.values():
+                job["timer"].cancel()
+            self._dubbing_jobs.clear()
+            self._dubbing_leases.clear()  # Browser watchdog restores even after process exit.
             self._clients.clear()
             self._videos.clear()
             self._sequences.clear()
@@ -313,9 +330,20 @@ class BrowserBridge(QObject):
                                          "preferred_language": job["preferred_language"]})
                         if len(captions) == 4:
                             break
-                return 200, {"jobs": pending, "caption_jobs": captions}
+                dubbing = []
+                for job_id, job in self._dubbing_jobs.items():
+                    if job["client"] == client_id and not job["sent"] and job["deadline"] > now:
+                        job["sent"] = True
+                        dubbing.append({"id": job_id, "tab_id": job["video"]["tab_id"], "video": job["video"],
+                                        "document_start": job["video"]["document_start"],
+                                        "lease_id": job["lease_id"], "enabled": job["enabled"]})
+                        if len(dubbing) == 4:
+                            break
+                return 200, {"jobs": pending, "caption_jobs": captions, "dubbing_jobs": dubbing}
             if path == "/v1/captions":
                 return self._receive_captions(body, client_id, now)
+            if path == "/v1/dubbing":
+                return self._receive_dubbing(body, client_id, now)
             if path == "/v1/result":
                 job = self._jobs.get(body.get("id", ""))
                 if not job or job["client"] != client_id or job["deadline"] <= now:
@@ -342,6 +370,7 @@ class BrowserBridge(QObject):
                 if path.endswith("closed"):
                     old = self._videos.pop(bridge_key, None)
                     self._cancel_caption_tab(bridge_key)
+                    self._cancel_dubbing_tab(bridge_key, "page_closed")
                     if old:
                         self.video_changed.emit({"key": old["key"], "tab_id": tab_id, "source_id": client_id,
                                                  "bridge_key": bridge_key, "closed": True})
@@ -352,6 +381,7 @@ class BrowserBridge(QObject):
                     old = self._videos.get(bridge_key)
                     if old and (old["key"] != video["key"] or old.get("document_start") != video.get("document_start")):
                         self._cancel_caption_tab(bridge_key)
+                        self._cancel_dubbing_tab(bridge_key, "video_changed")
                     self._videos[bridge_key] = video
                     self.video_changed.emit({k: v for k, v in video.items() if k != "_seen"})
                 return 200, {"accepted": True}
@@ -364,6 +394,7 @@ class BrowserBridge(QObject):
             for key in expired:
                 video = self._videos.pop(key)
                 self._cancel_caption_tab(key)
+                self._cancel_dubbing_tab(key, "bridge_disconnected")
                 self.video_changed.emit({"key": video["key"], "tab_id": video["tab_id"],
                                          "source_id": video["source_id"], "bridge_key": key, "closed": True})
             return [{k: list(v) if k == "audio_urls" else v for k, v in video.items() if k != "_seen"}
@@ -372,6 +403,148 @@ class BrowserBridge(QObject):
     def latest(self) -> dict | None:
         videos = self.videos()
         return videos[0] if videos else None
+
+    def set_dubbing(self, video: dict, enabled: bool, lease_id: str) -> str:
+        """Temporarily mute one exact Bilibili video, without blocking Qt.
+
+        Renew an enabled lease every second, using the same 32-hex lease ID.
+        An ``active`` acknowledgement confirms the page has muted the video.
+        Disable restores the previous mute state; page expiry after 3 seconds
+        covers failed requests, disconnected bridges and crashed applications.
+        Caller supplies local audio playback; this API never plays or seeks media.
+        """
+        if type(enabled) is not bool or not isinstance(lease_id, str) or not re.fullmatch(r"[a-f0-9]{32}", lease_id):
+            raise ValueError("无效的英文配音租约")
+        clean = normalize_video(video)
+        if clean["platform"] != "bilibili" or not clean["cid"]:
+            raise ValueError("英文配音第一期只支持已识别 CID 的 B 站视频")
+        bridge_key = str(video.get("bridge_key", ""))
+        with self._lock:
+            current = self._videos.get(bridge_key)
+            existing = self._dubbing_leases.get(lease_id)
+            if (existing and (existing["video"]["key"] != clean["key"] or
+                    existing["video"]["bridge_key"] != bridge_key or
+                    existing["video"]["document_start"] != clean["document_start"] or
+                    int(video.get("tab_id", -1)) != existing["video"]["tab_id"] or
+                    video.get("source_id") != existing["video"]["source_id"])):
+                raise ValueError("配音租约与所选网页不一致")
+            if enabled:
+                if (not self._server or not current or current["key"] != clean["key"] or
+                        current["document_start"] != clean["document_start"] or
+                        int(video.get("tab_id", -1)) != current["tab_id"] or
+                        video.get("source_id") != current["source_id"]):
+                    raise ValueError("网页视频已切换或浏览器连接已断开")
+                if current.get("dubbing_protocol") != 1:
+                    raise ValueError("请重新加载 0.1.4 及以上的桌面字幕连接器并刷新 B 站网页，再开启英文配音")
+                if current.get("ad_playing") or current.get("is_live"):
+                    raise ValueError("广告或直播期间暂不接管原视频声音")
+                for other_id, other in list(self._dubbing_leases.items()):
+                    if other_id != lease_id and other["enabled"]:
+                        self._queue_dubbing(other["video"], False, other_id)
+                identity = {k: current[k] for k in ("key", "platform", "video_id", "url", "page", "cid",
+                                                   "tab_id", "source_id", "bridge_key", "document_start")}
+            else:
+                # An old lease can still be released after the tab disappeared
+                # from the list, but a forged/stale identity cannot affect a new lease.
+                identity = existing["video"] if existing else None
+                if identity is None and current and current["key"] == clean["key"] and current["document_start"] == clean["document_start"]:
+                    identity = {k: current[k] for k in ("key", "platform", "video_id", "url", "page", "cid",
+                                                       "tab_id", "source_id", "bridge_key", "document_start")}
+                if not self._server or identity is None:
+                    raise ValueError("浏览器连接已断开；网页将在租约到期后恢复原声")
+            return self._queue_dubbing(identity, enabled, lease_id)
+
+    def _queue_dubbing(self, identity: dict, enabled: bool, lease_id: str) -> str:
+        # A newer command supersedes older acknowledgements for this lease.
+        for old_id, old in list(self._dubbing_jobs.items()):
+            if old["lease_id"] == lease_id:
+                old["timer"].cancel()
+                self._dubbing_jobs.pop(old_id)
+        request_id = secrets.token_hex(16)
+        timer = threading.Timer(2.5, self._dubbing_timeout, args=(request_id,))
+        timer.daemon = True
+        self._dubbing_jobs[request_id] = {"client": identity["source_id"], "video": dict(identity),
+            "lease_id": lease_id, "enabled": enabled, "sent": False, "timer": timer,
+            "deadline": time.monotonic() + 2.5}
+        previous = self._dubbing_leases.get(lease_id)
+        request_ids = ((previous or {}).get("request_ids", []) + [request_id])[-16:]
+        self._dubbing_leases[lease_id] = {"video": dict(identity), "enabled": enabled, "request_id": request_id,
+                                         "request_ids": request_ids}
+        timer.start()
+        return request_id
+
+    def _dubbing_timeout(self, request_id: str):
+        with self._lock:
+            job = self._dubbing_jobs.pop(request_id, None)
+            if job:
+                job["timer"].cancel()
+                self.dubbing_changed.emit({**job["video"], "request_id": request_id, "lease_id": job["lease_id"],
+                                          "status": "timeout", "enabled": job["enabled"], "reason": "request_timeout"})
+                if not job["enabled"]:
+                    self._dubbing_leases.pop(job["lease_id"], None)
+
+    def _cancel_dubbing_tab(self, bridge_key: str, reason: str):
+        for lease_id, lease in list(self._dubbing_leases.items()):
+            if lease["video"]["bridge_key"] != bridge_key:
+                continue
+            self._dubbing_leases.pop(lease_id, None)
+            for request_id, job in list(self._dubbing_jobs.items()):
+                if job["lease_id"] == lease_id:
+                    job["timer"].cancel()
+                    self._dubbing_jobs.pop(request_id)
+            self.dubbing_changed.emit({**lease["video"], "request_id": lease["request_id"], "lease_id": lease_id,
+                                      "status": "video_changed", "enabled": False, "reason": reason})
+
+    def _receive_dubbing(self, body: dict, client_id: str, now: float):
+        lease_id, request_id = body.get("lease_id", ""), body.get("id", "")
+        if not isinstance(lease_id, str) or not isinstance(request_id, str):
+            return 200, {"accepted": False}
+        lease = self._dubbing_leases.get(lease_id)
+        if not lease or lease["video"]["source_id"] != client_id:
+            return 200, {"accepted": False}
+        job = self._dubbing_jobs.get(request_id)
+        status = body.get("status")
+        try:
+            incoming = normalize_video(body.get("video", {}))
+            identity = lease["video"]
+            if (incoming["key"] != identity["key"] or int(body.get("tab_id", -1)) != identity["tab_id"] or
+                    float(body.get("document_start", -1)) != identity["document_start"] or
+                    not re.fullmatch(r"[a-f0-9]{32}", request_id) or request_id not in lease["request_ids"] or
+                    status not in DUBBING_STATUSES):
+                return 200, {"accepted": False}
+            current = self._videos.get(identity["bridge_key"])
+            if status == "active" and (not job or request_id != lease["request_id"] or not lease["enabled"] or
+                    job["deadline"] <= now or not current or current["key"] != identity["key"] or
+                    current["document_start"] != identity["document_start"]):
+                return 200, {"accepted": False}
+            # Errors are command acknowledgements; terminal page watchdog/user
+            # reports may arrive after their successful active acknowledgement.
+            if status == "error" and (not job or request_id != lease["request_id"] or job["deadline"] <= now):
+                return 200, {"accepted": False}
+            if job:
+                self._dubbing_jobs.pop(request_id, None)
+                job["timer"].cancel()
+            reason = body.get("reason", "")
+            reason = reason if isinstance(reason, str) and reason in DUBBING_REASONS else ""
+            event = {**identity, "request_id": request_id, "lease_id": lease_id, "status": status,
+                     "enabled": status == "active", "reason": reason}
+            for name, default, low, high in (("position", 0, 0, 604800), ("rate", 1, .1, 16)):
+                value = float(body.get(name, default))
+                event[name] = max(low, min(high, value)) if math.isfinite(value) else default
+            event.update(paused=bool(body.get("paused", True)), seeking=bool(body.get("seeking", False)),
+                         buffering=bool(body.get("buffering", False)))
+            serial = body.get("seek_serial", 0)
+            event["seek_serial"] = min(2147483647, serial) if type(serial) is int and serial >= 0 else 0
+            if status != "active":
+                self._dubbing_leases.pop(lease_id, None)
+                for pending_id, pending in list(self._dubbing_jobs.items()):
+                    if pending["lease_id"] == lease_id:
+                        pending["timer"].cancel()
+                        self._dubbing_jobs.pop(pending_id)
+            self.dubbing_changed.emit(event)
+            return 200, {"accepted": True}
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return 200, {"accepted": False}
 
     def request_captions(self, video: dict, generation=0, timeout: float = 12,
                          source_language: str = "auto") -> str:

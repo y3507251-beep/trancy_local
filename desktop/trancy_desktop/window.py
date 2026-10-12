@@ -102,6 +102,8 @@ class MainWindow(QMainWindow):
         self._translation_dirty = True
         self._displayed_key = None
         self._last_video = None
+        self._last_web_seek_serial = None
+        self._dubbing = None
         self._bound_tab = None
         self._closing = False
         self._backend_closed = False
@@ -240,6 +242,13 @@ class MainWindow(QMainWindow):
         web_layout.addWidget(self._button("生成所选网页视频双语字幕", self.start_browser, True))
         self.tabs.addTab(web, "B 站 / YouTube")
         self.tabs.setCurrentWidget(web)
+        self.english_dubbing = QCheckBox("启用英文配音（B 站 · 本地语音）")
+        self.english_dubbing.setChecked(False)
+        self.dubbing_status = QLabel("英文配音已关闭 · 播放原声")
+        self.dubbing_status.setWordWrap(True)
+        web_layout.addWidget(self.english_dubbing)
+        web_layout.addWidget(self.dubbing_status)
+        self.english_dubbing.toggled.connect(self._dubbing_toggled)
 
         controls = QHBoxLayout()
         controls.addWidget(self._button("停止当前任务", self.stop))
@@ -320,6 +329,43 @@ class MainWindow(QMainWindow):
     def _status(self, text):
         if not self._closing:
             self.status.setText(str(text))
+
+    def _dubbing_toggled(self, enabled):
+        if enabled and self._dubbing is None:
+            try:
+                from .dubbing import DubbingSession
+                self._dubbing = DubbingSession(self.bridge, self)
+                self._dubbing.status.connect(self.dubbing_status.setText)
+                self._dubbing.disabled.connect(self._dubbing_disabled)
+                self._dubbing.closed.connect(self._dubbing_closed)
+            except Exception:
+                self.english_dubbing.blockSignals(True)
+                self.english_dubbing.setChecked(False)
+                self.english_dubbing.blockSignals(False)
+                self.dubbing_status.setText("本地英文配音未能启动 · 播放原声")
+                LOG.exception("Dubbing initialization failed")
+                return
+        if self._dubbing:
+            self._dubbing.set_enabled(enabled)
+            self._refresh_dubbing()
+
+    def _dubbing_disabled(self, message):
+        self.english_dubbing.setChecked(False)
+        self.dubbing_status.setText(message)
+
+    def _refresh_dubbing(self):
+        if self._dubbing is None or self._closing:
+            return
+        video = (self._last_video if self.mode == "browser" and self._last_video
+                 and browser_identity(self._last_video) == self.identity else None)
+        self._dubbing.set_source(self.generation, video)
+        self._dubbing.set_cues(self.generation, self.timeline.cues)
+
+    def _dubbing_closed(self):
+        if self._closing:
+            self.bridge.stop()
+            if self._can_close():
+                self._finish_close()
 
     def _save_engine(self):
         self.settings.update(model=self.model.currentData(), device=self.device.currentData(),
@@ -464,6 +510,9 @@ class MainWindow(QMainWindow):
             self.web_position.setText(f"{self._time(current.get('position', 0))} / {self._time(current.get('duration', 0))}")
         else:
             self.web_position.setText("B 站 / YouTube")
+        if self._dubbing is not None:
+            position, paused, rate = self._playback_clock()
+            self._dubbing.tick(self._last_video if self.mode == "browser" else None, position, paused, rate)
 
     @staticmethod
     def _browser_tab(video):
@@ -492,6 +541,7 @@ class MainWindow(QMainWindow):
         self._new_source("browser", browser_identity(video), video.get("title", "网页视频"))
         self._bound_tab = self._browser_tab(video)
         self._last_video = dict(video, received_at=time.monotonic())
+        self._refresh_dubbing()
         self._buffer.set_duration(video.get("duration"))
         self._restore_cache()
         self._request_browser_captions(video)
@@ -632,6 +682,7 @@ class MainWindow(QMainWindow):
                 item["target_language"] = target
             prepared.append(item)
         self.timeline.add(prepared)
+        self._refresh_dubbing()
         self._displayed_key = None
         self._render_history()
         self._update_translation_window()
@@ -722,10 +773,11 @@ class MainWindow(QMainWindow):
             if (elapsed < 4 and not video.get("ad_playing") and not video.get("closed")
                     and browser_identity(video) == self.identity):
                 position = float(video.get("position") or 0)
-                if not video.get("paused", True):
+                paused = bool(video.get("paused", True) or video.get("buffering") or video.get("seeking"))
+                if not paused:
                     position += min(elapsed, 1.5) * float(video.get("rate") or 1)
                 self._buffer.set_duration(video.get("duration"))
-                return position, video.get("paused", True), video.get("rate") or 1
+                return position, paused, video.get("rate") or 1
         return None, True, 1
 
     def _update_translation_window(self, *, retry=False):
@@ -763,10 +815,14 @@ class MainWindow(QMainWindow):
     def _sync_playback(self, position, paused, rate):
         now = time.monotonic()
         seek = False
+        if self.mode == "browser" and self._last_video:
+            serial = self._last_video.get("seek_serial", 0)
+            seek = self._last_web_seek_serial is not None and serial != self._last_web_seek_serial
+            self._last_web_seek_serial = serial
         if self._last_playback is not None:
             previous, timestamp, was_paused, previous_rate = self._last_playback
             expected = previous if was_paused else previous + max(0, now - timestamp) * previous_rate
-            seek = abs(position - expected) > 3
+            seek = seek or abs(position - expected) > 3
         self._last_playback = (position, now, bool(paused), float(rate))
         if self._translation_dirty:
             self._update_translation_window()
@@ -846,6 +902,7 @@ class MainWindow(QMainWindow):
                 added = self.timeline.add(cues)
             if added:
                 self._update_translation_window()
+            self._refresh_dubbing()
             self._displayed_key = None
             self._render_history()
         if kind in ("result", "error", "cancelled"):
@@ -878,6 +935,7 @@ class MainWindow(QMainWindow):
             return
         LOG.info("translation_result generation=%s cues=%s", self.generation, len(event["cues"]))
         self.timeline.update_translations(event["cues"])
+        self._refresh_dubbing()
         self._displayed_key = None
         self._render_history()
         self._save_cache()
@@ -953,11 +1011,14 @@ class MainWindow(QMainWindow):
             self._save_cache()
         cue = None
         position = None
+        paused, rate = True, 1
         if self.mode in ("potplayer", "browser"):
             position, paused, rate = self._playback_clock()
             if position is not None:
                 self._sync_playback(float(position), paused, rate)
                 cue = self.timeline.at(position)
+        if self._dubbing is not None:
+            self._dubbing.tick(self._last_video if self.mode == "browser" else None, position, paused, rate)
         key = (cue_key(cue), cue.get("translation", ""),
                tuple((w.get("text"), w.get("start"), w.get("end")) for w in (cue.get("words") or []))) if cue else None
         if key != self._displayed_key:
@@ -972,6 +1033,8 @@ class MainWindow(QMainWindow):
             self.overlay.set_position(position)
 
     def stop(self):
+        if self._dubbing is not None:
+            self._dubbing.stop()
         self._save_cache(force=True)
         self.generation += 1
         if hasattr(self, "translator"):
@@ -980,6 +1043,7 @@ class MainWindow(QMainWindow):
         self._source_complete = False
         self._bound_tab = None
         self._last_video = None
+        self._last_web_seek_serial = None
         self._last_playback = None
         self._cache_pending = False
         self._recognition_blocked = False
@@ -1066,6 +1130,7 @@ class MainWindow(QMainWindow):
         return (self._backend_closed and self._temp_recycling == 0
                 and not self.downloader.running
                 and self._download_context is None and not self._native_readers
+                and (self._dubbing is None or self._dubbing.is_closed)
                 and self.translator.is_closed)
 
     def closeEvent(self, event):
@@ -1083,7 +1148,10 @@ class MainWindow(QMainWindow):
         self.overlay.hide()
         self.pot.stop()
         self.translator.shutdown()
-        self.bridge.stop()
+        if self._dubbing is None:
+            self.bridge.stop()
+        else:
+            self._dubbing.shutdown()
         self.asr.shutdown()
 
     def _finish_close(self):
