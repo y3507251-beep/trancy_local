@@ -32,6 +32,7 @@
         chrome.runtime.sendMessage({to: [], kind: "trancy-desktop-captions-report-v1", href: location.href,
           document_start: data.document_start, sequence: data.sequence, request_id: data.request_id,
           video, status: data.status, source_language: data.source_language, caption_source: data.caption_source,
+          error_code: data.error_code, native_track_available: data.native_track_available,
           cues: data.cues}).catch(() => { alive = false; });
       } catch (_) { alive = false; }
       return;

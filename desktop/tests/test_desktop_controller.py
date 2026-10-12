@@ -129,7 +129,7 @@ class FakeBridge(QObject):
         super().__init__(parent)
         self.items = []
         self.caption_requests = []
-        self.caption_result = {"status": "unavailable", "cues": []}
+        self.caption_result = {"status": "unavailable", "native_track_available": False, "cues": []}
         self.cancelled_captions = []
 
     def videos(self): return list(self.items)
@@ -512,6 +512,30 @@ class ControllerTests(unittest.TestCase):
         w._tick()
         self.assertEqual(w.overlay.last[0], "Hello everyone.")
 
+    def test_native_browser_cold_start_does_not_create_a_real_asr_process(self):
+        from trancy_desktop.recognition import ASRSession
+        with patch.object(controller, "ASRSession", ASRSession):
+            w = controller.MainWindow(MemorySettings())
+        try:
+            w.tick.stop()
+            w.model.setCurrentIndex(w.model.findData("qwen3-asr-1.7b"))
+            self.assertIsNone(w.asr.process)
+            w.bridge.caption_result = {"status": "ready", "source_language": "zh-CN",
+                                      "cues": [{"start": 2, "end": 6, "text": "这是已有的中文字幕"}]}
+            current = dict(video(), platform="bilibili", video_id="BV1xx411c7mD", cid="12345",
+                           url="https://www.bilibili.com/video/BV1xx411c7mD/?p=1")
+            w._start_browser_video(current)
+            w._tick()
+            self.assertIsNone(w.asr.process)
+            self.assertEqual(w.downloader.requests, [])
+            self.assertEqual(w._source_kind, "native")
+            self.assertTrue(w.translator.windows)
+        finally:
+            w.tick.stop()
+            w.asr.shutdown()
+            w.hide()
+            w.deleteLater()
+
     def test_potplayer_native_subtitles_skip_asr_and_reuse_platform_translation(self):
         w = self.window
         w.pot.state.update(connected=True, path=str(Path(__file__).resolve()), position=3, duration=60, paused=True)
@@ -570,7 +594,7 @@ class ControllerTests(unittest.TestCase):
         w._downloaded(str(Path(directory) / "media-test" / "audio.wav"), public)
         self.assertEqual(w.asr.requests, [])
 
-    def test_native_caption_timeout_falls_back_once_and_discards_late_ready(self):
+    def test_native_caption_timeout_retries_text_without_audio_or_model(self):
         w = self.window
         w.bridge.caption_result = None
         current = video()
@@ -580,8 +604,98 @@ class ControllerTests(unittest.TestCase):
                      bridge_key=w._bound_tab, status="timeout")
         w._browser_captions(event)
         w._browser_captions(dict(event, status="ready", cues=[{"start": 0, "end": 5, "text": "late"}]))
-        self.assertEqual(len(w.downloader.requests), 1)
+        self.assertEqual(w.downloader.requests, [])
+        self.assertEqual(w.asr.requests, [])
         self.assertEqual(w.timeline.cues, [])
+        self.flush_scheduled()
+        self.assertEqual(len(w.bridge.caption_requests), 2)
+        w._browser_captions(dict(event, request_id=w._caption_context["request_id"], status="ready",
+                                cues=[{"start": 0, "end": 5, "text": "Native caption"}]))
+        w._tick()
+        self.assertEqual(w.timeline.cues[0]["text"], "Native caption")
+        self.assertEqual(w.downloader.requests, [])
+        self.assertEqual(w.asr.requests, [])
+
+    def test_repeated_native_fetch_failure_stays_in_text_mode_and_manual_retry_works(self):
+        w = self.window
+        w.bridge.caption_result = {"status": "error", "cues": [], "native_track_available": True,
+                                  "error_code": "bili_track_failed"}
+        w._start_browser_video(video())
+        self.flush_scheduled()
+        self.flush_scheduled()
+        self.assertEqual(len(w.bridge.caption_requests), 2)
+        self.assertTrue(w._caption_context["failed"])
+        self.assertIn("重试未完成字幕", w.status.text())
+        w._tick()
+        self.assertEqual(w.downloader.requests, [])
+        self.assertEqual(w.asr.requests, [])
+        w.bridge.caption_result = {"status": "ready", "source_language": "en",
+                                  "cues": [{"start": 0, "end": 5, "text": "Retry worked"}]}
+        w.retry_translation()
+        self.assertEqual(len(w.bridge.caption_requests), 3)
+        self.assertEqual(w.timeline.cues[0]["text"], "Retry worked")
+        self.assertEqual(w.downloader.requests, [])
+
+    def test_known_native_track_cannot_be_misclassified_as_missing(self):
+        w = self.window
+        w.bridge.caption_result = {"status": "unavailable", "native_track_available": True, "cues": []}
+        w._start_browser_video(video())
+        self.flush_scheduled()
+        self.assertEqual(w.downloader.requests, [])
+        self.assertEqual(w.asr.requests, [])
+
+    def test_old_connector_missing_track_confirmation_does_not_load_model(self):
+        w = self.window
+        w.bridge.caption_result = {"status": "unavailable", "cues": []}
+        w._start_browser_video(video())
+        self.flush_scheduled()
+        self.assertEqual(w.downloader.requests, [])
+        self.assertEqual(w.asr.requests, [])
+
+    def test_previous_source_model_event_does_not_replace_native_mode_label(self):
+        w = self.window
+        w.bridge.caption_result = {"status": "ready", "cues": [{"start": 0, "end": 5, "text": "Native"}]}
+        w._start_browser_video(video())
+        w._active = {"generation": w.generation - 1, "job_id": "old-loading-model", "window": (0, 12)}
+        before = w.model_info.text()
+        w._asr_event({"event": "model", "job_id": "old-loading-model", "model": "qwen3-asr-1.7b", "device": "cuda"})
+        self.assertEqual(w.model_info.text(), before)
+
+    def test_disconnected_caption_bridge_does_not_trigger_asr(self):
+        w = self.window
+        with patch.object(w.bridge, "request_captions", side_effect=ValueError("connection unavailable")):
+            w._start_browser_video(video())
+        self.assertEqual(w.downloader.requests, [])
+        self.assertIn("重试未完成字幕", w.status.text())
+        w.bridge.caption_result = {"status": "ready", "cues": [{"start": 0, "end": 5, "text": "Recovered"}]}
+        w.retry_translation()
+        self.assertEqual(len(w.bridge.caption_requests), 1)
+        self.assertEqual(w.timeline.cues[0]["text"], "Recovered")
+        self.assertEqual(w.asr.requests, [])
+
+    def test_stop_cancels_scheduled_native_caption_retry(self):
+        w = self.window
+        w.bridge.caption_result = {"status": "error", "cues": []}
+        w._start_browser_video(video())
+        w.stop()
+        self.flush_scheduled()
+        self.assertEqual(len(w.bridge.caption_requests), 1)
+        self.assertEqual(w.asr.requests, [])
+
+    def test_confirmed_missing_browser_track_still_uses_short_audio_recognition(self):
+        w = self.window
+        w.bridge.caption_result = {"status": "unavailable", "native_track_available": False, "cues": []}
+        current = dict(video(), position=400, duration=3600)
+        w._start_browser_video(current)
+        self.assertEqual(len(w.downloader.requests), 1)
+        public, directory = w.downloader.requests[0]
+        w.downloader.running = False
+        path = str(Path(directory) / "media-test" / "audio.wav")
+        with patch.object(Path, "is_file", return_value=True):
+            w._downloaded(path, public)
+        self.assertEqual(len(w.asr.requests), 1)
+        options = w.asr.requests[0][2]
+        self.assertEqual((options["start_seconds"], options["duration_seconds"]), (398, 12))
 
     def test_same_video_document_reload_restarts_caption_request_even_without_follow(self):
         w = self.window

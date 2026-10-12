@@ -23,6 +23,12 @@ from PyQt6.QtCore import QObject, pyqtSignal
 from .translation import TranslationError
 
 
+CAPTION_ERROR_CODES = frozenset({
+    "bili_metadata_failed", "bili_track_failed", "youtube_metadata_failed", "youtube_track_failed",
+    "observer_unavailable", "video_changed", "invalid_caption_payload", "bridge_upload_failed",
+})
+
+
 def extension_id() -> str:
     manifest_path = Path(__file__).resolve().parents[1] / "browser-extension" / "manifest.json"
     manifest = json.loads(manifest_path.read_text("utf-8"))
@@ -280,6 +286,8 @@ class BrowserBridge(QObject):
                     self._clients[client_id] = {"token": secrets.token_urlsafe(32), "seen": now}
                 client = self._clients[client_id]
                 client["seen"] = now
+                version = body.get("connector_version", "")
+                client["version"] = version if isinstance(version, str) and re.fullmatch(r"\d+\.\d+\.\d+", version) else "unknown"
                 if first:
                     self.status_changed.emit("浏览器插件已连接，可使用插件当前字幕翻译引擎")
                 return 200, {"session": client["token"], "protocol": 1}
@@ -340,7 +348,7 @@ class BrowserBridge(QObject):
                 else:
                     video = normalize_video(body["video"])
                     video.update({"tab_id": tab_id, "source_id": client_id, "bridge_key": bridge_key,
-                                  "updated_at": time.time(), "_seen": now})
+                                  "updated_at": time.time(), "_seen": now, "connector_version": client["version"]})
                     old = self._videos.get(bridge_key)
                     if old and (old["key"] != video["key"] or old.get("document_start") != video.get("document_start")):
                         self._cancel_caption_tab(bridge_key)
@@ -413,10 +421,14 @@ class BrowserBridge(QObject):
         event = {**job["video"], "request_id": job_id, "generation": job["generation"],
                  "status": status, "source_language": job["language"],
                  "caption_source": job["caption_source"], "cues": cues or []}
+        if job.get("error_code") in CAPTION_ERROR_CODES:
+            event["error_code"] = job["error_code"]
+        if isinstance(job.get("native_track_available"), bool):
+            event["native_track_available"] = job["native_track_available"]
         if status == "error":
-            event["message"] = "读取网站已有字幕失败，可以重试或回退语音识别"
+            event["message"] = "读取网站已有字幕失败，请重试原字幕"
         elif status == "timeout":
-            event["message"] = "等待网站原字幕超时，可以重试或回退语音识别"
+            event["message"] = "等待网站原字幕超时，请重试原字幕"
         self.captions_ready.emit(event)
 
     def _caption_timeout(self, job_id: str):
@@ -436,7 +448,13 @@ class BrowserBridge(QObject):
                     float(body.get("document_start", -1)) != current.get("document_start", 0)):
                 return 200, {"accepted": False}
             status = body.get("status")
+            code = body.get("error_code")
+            job["error_code"] = code if isinstance(code, str) and code in CAPTION_ERROR_CODES else ""
+            if isinstance(body.get("native_track_available"), bool):
+                job["native_track_available"] = body["native_track_available"]
             if status in {"error", "unavailable"}:
+                if status == "unavailable" and job.get("native_track_available") is True:
+                    status = "error"
                 self._finish_captions(job_id, status)
                 return 200, {"accepted": True}
             if status != "ready":
@@ -464,6 +482,7 @@ class BrowserBridge(QObject):
                 self._finish_captions(job_id, "ready", sorted(output, key=lambda c: (c["start"], c["end"])))
             return 200, {"accepted": True}
         except (KeyError, TypeError, ValueError, OverflowError):
+            job["error_code"] = "invalid_caption_payload"
             self._finish_captions(job_id, "error")
             return 200, {"accepted": True}
 

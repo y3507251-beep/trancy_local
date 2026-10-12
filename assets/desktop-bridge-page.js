@@ -8,11 +8,13 @@
   const initialHref = location.href;
   const biliCaptures = new Map();
   const biliSubtitleCaptures = new Map();
+  const biliSubtitleBodies = new Map();
   const youtubeCaptures = new Map();
   const captionCache = new Map();
   const captionRequests = new Map();
   const siteFetch = window.fetch;
   let sequence = 0;
+  let requestSequence = 0;
 
   function pageIdentity(href = location.href) {
     try {
@@ -53,30 +55,74 @@
     return [...new Set(urls.filter(u => typeof u === "string" && validMedia(u, "bilibili", cid)))].slice(0, 12);
   }
 
-  function inspectBiliResponse(requestUrl, payload, requestedPage) {
+  function biliRequestIdentity() {
+    const identity = pageIdentity();
+    if (!identity || identity.platform !== "bilibili") return identity;
+    const state = window.__INITIAL_STATE__?.videoData;
+    const selected = state?.bvid === identity.video_id ? state.pages?.find(p => Number(p.page) === identity.page) : null;
+    const first = pageIdentity(initialHref);
+    const initialCid = state?.bvid === identity.video_id && first?.video_id === identity.video_id && first?.page === identity.page ? state?.cid : "";
+    const cid = selected?.cid || biliCaptures.get(`${identity.video_id}:${identity.page}`)?.cid || initialCid;
+    return {...identity, cid: /^[1-9][0-9]{0,19}$/.test(String(cid || "")) ? String(cid) : ""};
+  }
+
+  function inspectBiliResponse(requestUrl, payload, requestedPage, ordinal = 0) {
     try {
       const url = new URL(requestUrl, location.href);
       const current = pageIdentity();
       if (!current || current.platform !== "bilibili" || url.hostname !== "api.bilibili.com" ||
-          !/^\/x\/player\/(?:wbi\/)?(?:playurl|v2)$/.test(url.pathname) || payload?.code !== 0) return;
+          !/^\/x\/player\/(?:wbi\/)?(?:playurl|v2)$/.test(url.pathname)) return;
       if (!requestedPage || requestedPage.url !== current.url) return;
       const cid = url.searchParams.get("cid");
       if (!/^[1-9][0-9]{0,19}$/.test(cid || "")) return;
       const state = window.__INITIAL_STATE__?.videoData;
-      const bvid = url.searchParams.get("bvid") || (String(state?.aid) === url.searchParams.get("avid") ? state?.bvid : "");
+      const requestedAid = url.searchParams.get("aid") || url.searchParams.get("avid");
+      const bvid = url.searchParams.get("bvid") || (requestedAid && String(state?.aid) === requestedAid ? state?.bvid : "");
       if (bvid !== current.video_id) return;
+      if (requestedAid && state?.bvid === bvid && String(state.aid) !== requestedAid) return;
       const pageInfo = state?.bvid === bvid ? state.pages?.find(p => Number(p.page) === current.page) : null;
       if (pageInfo && String(pageInfo.cid) !== cid) return;
+      if (requestedPage.cid && requestedPage.cid !== cid) return;
       if (url.pathname.endsWith("/v2")) {
+        const key = `${bvid}:${current.page}:${cid}`;
+        const previous = biliSubtitleCaptures.get(key);
+        if (previous && previous.ordinal > ordinal) return;
         if (Array.isArray(payload.data?.subtitle?.subtitles)) {
-          biliSubtitleCaptures.set(`${bvid}:${current.page}:${cid}`, payload.data.subtitle.subtitles);
-          while (biliSubtitleCaptures.size > 8) biliSubtitleCaptures.delete(biliSubtitleCaptures.keys().next().value);
+          if (payload?.code !== 0) return;
+          biliSubtitleCaptures.set(key, {tracks: payload.data.subtitle.subtitles, provenance: "native", ordinal});
+        } else if (payload && typeof payload.code === "number" && payload.code !== 0) {
+          // A failed authenticated/native request cannot prove that no track exists.
+          // It must not invalidate a previously successful track/body binding.
+          if (!Array.isArray(previous?.tracks) || !previous.tracks.length) {
+            biliSubtitleCaptures.set(key, {tracks: null, provenance: "native", ordinal});
+          }
         }
+        while (biliSubtitleCaptures.size > 8) biliSubtitleCaptures.delete(biliSubtitleCaptures.keys().next().value);
         return;
       }
+      if (payload?.code !== 0) return;
       biliCaptures.set(`${bvid}:${current.page}`, {cid, audio: biliAudio(payload.data, cid)});
       while (biliCaptures.size > 8) biliCaptures.delete(biliCaptures.keys().next().value);
     } catch (_) { /* Never interfere with the site's request. */ }
+  }
+
+  function inspectBiliSubtitle(requestUrl, payload, requestedPage, ordinal = 0) {
+    try {
+      const url = biliCaptionUrl(requestUrl), current = biliRequestIdentity();
+      if (!requestedPage?.cid || !current?.cid || nativeIdentity(requestedPage) !== nativeIdentity(current) ||
+          !Array.isArray(payload?.body) || !payload.body.length || payload.body.length > 20000) return;
+      const body = payload.body.filter(c => c && typeof c.content === "string" && c.content.trim() && c.content.length <= 16000 &&
+        Number.isFinite(c.from) && Number.isFinite(c.to) && 0 <= c.from && c.from < c.to && c.to <= 604800)
+        .map(c => ({from: c.from, to: c.to, content: c.content}));
+      if (!body.length || body.reduce((n, c) => n + c.content.length, 0) > 2000000) return;
+      // A CDN URL alone contains no CID. Keep a request-time snapshot, and use
+      // this body only after its URL is also present in metadata for this exact
+      // BV / page / CID. Preloaded next-video bodies cannot become current cues.
+      const previous = biliSubtitleBodies.get(url);
+      if (previous?.identity === nativeIdentity(current) && previous.ordinal > ordinal) return;
+      biliSubtitleBodies.set(url, {identity: nativeIdentity(current), payload: {body}, ordinal});
+      while (biliSubtitleBodies.size > 12) biliSubtitleBodies.delete(biliSubtitleBodies.keys().next().value);
+    } catch (_) { /* Ignore other assets and foreign/unbound subtitle URLs. */ }
   }
 
   function timedtextUrl(raw) {
@@ -98,8 +144,11 @@
     while (youtubeCaptures.size > 12) youtubeCaptures.delete(youtubeCaptures.keys().next().value);
   }
 
-  function inspectResponse(url, payload, identity) {
-    if (identity?.platform === "bilibili") inspectBiliResponse(url, payload, identity);
+  function inspectResponse(url, payload, identity, ordinal = 0) {
+    if (identity?.platform === "bilibili") {
+      if (/\/bfs\/(?:ai_)?subtitle\//.test(url)) inspectBiliSubtitle(url, payload, identity, ordinal);
+      else inspectBiliResponse(url, payload, identity, ordinal);
+    }
     else if (identity?.platform === "youtube") inspectYoutubeResponse(url, payload, identity);
   }
 
@@ -108,12 +157,12 @@
       location.hostname === "bilibili.com" || location.hostname.endsWith(".bilibili.com")) {
     const originalFetch = window.fetch;
     window.fetch = function (...args) {
-      const requestUrl = typeof args[0] === "string" ? args[0] : args[0]?.url;
-      const requestedPage = pageIdentity();
+      const requestUrl = typeof args[0] === "string" ? args[0] : args[0] instanceof URL ? args[0].href : args[0]?.url;
+      const requestedPage = biliRequestIdentity(), ordinal = ++requestSequence;
       return originalFetch.apply(this, args).then(response => {
-        if (typeof requestUrl === "string" && /\/(?:playurl|v2|api\/timedtext)(?:\?|$)/.test(requestUrl)) {
-          response.clone().json().then(data => inspectResponse(requestUrl, data, requestedPage))
-            .catch(() => inspectResponse(requestUrl, null, requestedPage));
+        if (typeof requestUrl === "string" && (/\/(?:playurl|v2|api\/timedtext)(?:\?|$)/.test(requestUrl) || /\/bfs\/(?:ai_)?subtitle\//.test(requestUrl))) {
+          response.clone().json().then(data => inspectResponse(requestUrl, data, requestedPage, ordinal))
+            .catch(() => inspectResponse(requestUrl, null, requestedPage, ordinal));
         }
         return response;
       });
@@ -122,16 +171,19 @@
     const xhrRequests = new WeakMap();
     const observedRequests = new WeakSet();
     XMLHttpRequest.prototype.open = function (method, url, ...rest) {
-      xhrRequests.set(this, {url: String(url), page: pageIdentity()});
+      xhrRequests.set(this, {url: String(url), page: biliRequestIdentity(), ordinal: ++requestSequence});
       if (!observedRequests.has(this)) {
         observedRequests.add(this);
         this.addEventListener("load", () => {
           try {
             const request = xhrRequests.get(this);
-            if (!request || !/\/(?:playurl|v2|api\/timedtext)(?:\?|$)/.test(request.url)) return;
+            if (!request || (!/\/(?:playurl|v2|api\/timedtext)(?:\?|$)/.test(request.url) && !/\/bfs\/(?:ai_)?subtitle\//.test(request.url))) return;
             let payload = null;
             try { payload = this.responseType === "json" ? this.response : JSON.parse(this.responseText); } catch (_) { /* Keep native URL context. */ }
-            inspectResponse(this.responseURL || request.url, payload, request.page);
+            // Metadata binds the original requested CDN URL; a signed redirect
+            // does not change the current subtitle track's identity.
+            inspectResponse(/\/bfs\/(?:ai_)?subtitle\//.test(request.url) ? request.url : this.responseURL || request.url,
+              payload, request.page, request.ordinal);
           } catch (_) { /* Unrelated or unreadable response. */ }
         });
       }
@@ -328,16 +380,86 @@
     return url.href;
   }
 
+  function captionFailure(code, available) {
+    const error = new Error(code); error.captionCode = code;
+    if (typeof available === "boolean") error.nativeTrackAvailable = available;
+    return error;
+  }
+
+  function biliTrackBody(track, video) {
+    try {
+      const capture = biliSubtitleBodies.get(biliCaptionUrl(track.subtitle_url));
+      return capture?.identity === nativeIdentity(video) ? capture : null;
+    } catch (_) { return null; }
+  }
+
+  async function biliTracks(video, signal) {
+    const key = `${video.video_id}:${video.page}:${video.cid}`;
+    const existing = biliSubtitleCaptures.get(key);
+    if (Array.isArray(existing?.tracks)) return existing.tracks;
+    // A native wbi/v2 response may still be in flight. Race its normal page
+    // response against one unsigned, legacy metadata request; do not sign WBI
+    // or export credentials. An empty legacy response alone is inconclusive.
+    const legacyController = new AbortController();
+    const abort = () => legacyController.abort();
+    if (signal.aborted) abort();
+    signal.addEventListener("abort", abort, {once: true});
+    const started = Date.now();
+    let legacy = null, completed = 0;
+    const url = new URL("https://api.bilibili.com/x/player/v2");
+    url.searchParams.set("bvid", video.video_id); url.searchParams.set("cid", video.cid);
+    const state = window.__INITIAL_STATE__?.videoData;
+    if (state?.bvid === video.video_id && /^[1-9][0-9]{0,19}$/.test(String(state.aid || ""))) url.searchParams.set("aid", String(state.aid));
+    void fetchJson(url.href, legacyController.signal).then(payload => {
+      if (payload?.code === 0 && Array.isArray(payload.data?.subtitle?.subtitles)) legacy = payload.data.subtitle.subtitles;
+      completed = Date.now();
+    }).catch(() => {completed = Date.now();});
+    try {
+      while (!signal.aborted && stillCurrent(video) && Date.now() - started < 6500) {
+        const native = biliSubtitleCaptures.get(key);
+        if (Array.isArray(native?.tracks)) return native.tracks;
+        if (legacy?.length) {
+          biliSubtitleCaptures.set(key, {tracks: legacy, provenance: "legacy", ordinal: 0});
+          while (biliSubtitleCaptures.size > 8) biliSubtitleCaptures.delete(biliSubtitleCaptures.keys().next().value);
+          return legacy;
+        }
+        if (completed && Date.now() >= Math.max(started + 1800, completed + 600)) break;
+        await new Promise(resolve => setTimeout(resolve, 120));
+      }
+      throw captionFailure("bili_metadata_failed");
+    } finally {
+      legacyController.abort(); signal.removeEventListener("abort", abort);
+    }
+  }
+
+  async function downloadBiliTrack(track, video, signal, timeout = 4500) {
+    const cached = biliTrackBody(track, video);
+    if (cached) return biliCues(cached.payload, track.language, track.kind);
+    try {
+      const url = biliCaptionUrl(track.subtitle_url);
+      const payload = await fetchJson(url, signal, "omit", timeout);
+      if (!stillCurrent(video)) throw new Error("video changed");
+      const cues = biliCues(payload, track.language, track.kind);
+      inspectBiliSubtitle(url, payload, biliRequestIdentity(), ++requestSequence);
+      return cues;
+    } catch (_) {
+      // The page may have loaded this same chosen track during our request.
+      const arrived = biliTrackBody(track, video);
+      if (arrived) return biliCues(arrived.payload, track.language, track.kind);
+      throw captionFailure("bili_track_failed", true);
+    }
+  }
+
   async function loadNativeCaptions(video, preferred, signal) {
     const cacheKey = `${nativeIdentity(video)}:${captionLanguage(preferred)}`;
     if (captionCache.has(cacheKey)) return captionCache.get(cacheKey);
-    let tracks, download, sourceHint = "";
+    let tracks, download, sourceHint = "", cachedPrimary = null;
     if (video.platform === "youtube") {
       const player = document.querySelector("#movie_player") || document.querySelector("#player");
       const response = player?.getPlayerResponse?.() || window.ytInitialPlayerResponse;
-      if (response?.videoDetails?.videoId !== video.video_id) throw new Error("stale player response");
+      if (response?.videoDetails?.videoId !== video.video_id) throw captionFailure("youtube_metadata_failed");
       const nativeTracks = response.captions?.playerCaptionsTracklistRenderer?.captionTracks;
-      if (!Array.isArray(nativeTracks) || !nativeTracks.length) return {status: "unavailable", cues: []};
+      if (!Array.isArray(nativeTracks) || !nativeTracks.length) return {status: "unavailable", cues: [], native_track_available: false};
       tracks = nativeTracks.filter(t => timedtextUrl(t.baseUrl)?.searchParams.get("v") === video.video_id)
         .map(t => ({...t, language: captionLanguage(t.languageCode), captionKind: t.kind === "asr" ? "asr" : "human",
           kind: t.kind === "asr" ? "asr" : "human"}));
@@ -346,30 +468,30 @@
       sourceHint = nativeTracks.find(t => t.kind === "asr")?.languageCode || "";
       download = track => downloadYoutubeTrack({...track, kind: track.nativeKind}, video, signal, Date.now() + 7000);
     } else {
-      if (!/^[1-9][0-9]{0,19}$/.test(video.cid || "")) throw new Error("missing current CID");
-      const captureKey = `${video.video_id}:${video.page}:${video.cid}`;
-      let nativeTracks = biliSubtitleCaptures.get(captureKey);
-      if (!nativeTracks) {
-        const url = new URL("https://api.bilibili.com/x/player/v2");
-        url.searchParams.set("bvid", video.video_id); url.searchParams.set("cid", video.cid);
-        const payload = await fetchJson(url.href, signal);
-        if (!stillCurrent(video) || payload?.code !== 0 || !Array.isArray(payload.data?.subtitle?.subtitles)) {
-          throw new Error("Bilibili track metadata failed");
-        }
-        nativeTracks = payload.data.subtitle.subtitles; biliSubtitleCaptures.set(captureKey, nativeTracks);
-      }
-      if (!nativeTracks.length) return {status: "unavailable", cues: []};
+      if (!/^[1-9][0-9]{0,19}$/.test(video.cid || "")) throw captionFailure("bili_metadata_failed");
+      const nativeTracks = await biliTracks(video, signal);
+      if (!nativeTracks.length) return {status: "unavailable", cues: [], native_track_available: false};
       tracks = nativeTracks.filter(t => typeof t.subtitle_url === "string").map(t => ({...t,
         language: captionLanguage(t.lan), kind: String(t.lan).startsWith("ai-") ? "asr" : "human"}));
-      download = async track => biliCues(await fetchJson(biliCaptionUrl(track.subtitle_url), signal, "omit"), track.language, track.kind);
+      // Reuse the track already chosen and loaded by the native player. Its
+      // language comes from this video's validated track list, not from a URL.
+      const preferredLanguage = captionLanguage(preferred);
+      const loaded = tracks.map(t => ({track: t, body: biliTrackBody(t, video)})).filter(t => t.body &&
+        (!preferredLanguage || preferredLanguage === "auto" || sameLanguage(t.track.language, preferredLanguage)))
+        .sort((a, b) => b.body.ordinal - a.body.ordinal)[0];
+      cachedPrimary = loaded?.track || null;
+      sourceHint = cachedPrimary?.language || "";
+      download = track => downloadBiliTrack(track, video, signal);
     }
-    if (!tracks.length) throw new Error("native subtitle URL missing");
-    const primary = chooseTrack(tracks, preferred, sourceHint);
+    if (!tracks.length) throw captionFailure(video.platform === "bilibili" ? "bili_track_failed" : "youtube_track_failed", true);
+    const primary = cachedPrimary || chooseTrack(tracks, preferred, sourceHint);
     const target = oppositeLanguage(primary.language);
     const secondary = target && tracks.find(t => sameLanguage(t.language, target) && t.kind === "human");
     // Obtain original text first. Optional target failure never discards it.
-    const cues = await download(primary);
-    if (!stillCurrent(video) || signal.aborted) throw new Error("video changed");
+    let cues;
+    try { cues = await download(primary); }
+    catch (error) { throw error?.captionCode ? error : captionFailure(video.platform === "bilibili" ? "bili_track_failed" : "youtube_track_failed", true); }
+    if (!stillCurrent(video) || signal.aborted) throw captionFailure("video_changed", true);
     if (secondary) {
       const secondaryController = new AbortController();
       const timer = setTimeout(() => secondaryController.abort(), 1000);
@@ -377,14 +499,14 @@
         // Native target retrieval is best effort; Google can fill any remaining
         // lines immediately instead of waiting for the complete second track.
         let translated;
-        if (video.platform === "bilibili") translated = biliCues(await fetchJson(biliCaptionUrl(secondary.subtitle_url), secondaryController.signal, "omit", 1000), secondary.language, secondary.kind);
+        if (video.platform === "bilibili") translated = await downloadBiliTrack(secondary, video, secondaryController.signal, 1000);
         else translated = youtubeCues(await fetchJson(youtubeCaptionUrl({...secondary, kind: secondary.nativeKind}, video), secondaryController.signal, "include", 1000), secondary.language, secondary.captionKind);
         mergeNativeTranslation(cues, translated, secondary.language);
       } catch (_) { /* Retain the usable original track. */ }
       finally { clearTimeout(timer); }
     }
     const result = {status: "ready", cues, source_language: primary.language,
-      caption_source: `${video.platform}-${primary.captionKind || primary.kind}`};
+      caption_source: `${video.platform}-${primary.captionKind || primary.kind}`, native_track_available: true};
     captionCache.set(cacheKey, result);
     while (captionCache.size > 8) captionCache.delete(captionCache.keys().next().value);
     return result;
@@ -401,7 +523,9 @@
     captionRequests.set(message.request_id, {controller, identity: nativeIdentity(found)});
     const timer = setTimeout(() => controller.abort(), 9500);
     const metadata = {platform: found.platform, video_id: found.video_id, url: found.url, page: found.page, cid: found.cid};
-    void loadNativeCaptions(metadata, message.preferred_language, controller.signal).catch(() => ({status: "error", cues: []}))
+    void loadNativeCaptions(metadata, message.preferred_language, controller.signal).catch(error => ({status: "error", cues: [],
+      ...(error?.captionCode ? {error_code: error.captionCode} : {}),
+      ...(typeof error?.nativeTrackAvailable === "boolean" ? {native_track_available: error.nativeTrackAvailable} : {})}))
       .then(result => {
         if (!stillCurrent(metadata)) return;
         window.postMessage({kind: "trancy-desktop-captions-v1", document_start: docStart,

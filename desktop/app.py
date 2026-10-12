@@ -11,7 +11,7 @@ def main():
     from PyQt6.QtWidgets import QApplication, QMessageBox
     from trancy_desktop.settings import DATA
     (DATA / "logs").mkdir(parents=True, exist_ok=True)
-    logging.basicConfig(filename=str(DATA / "logs" / "desktop.log"), level=logging.WARNING,
+    logging.basicConfig(filename=str(DATA / "logs" / "desktop.log"), level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s", encoding="utf-8")
     app = QApplication(sys.argv)
     app.setApplicationName("Trancy 桌面字幕")

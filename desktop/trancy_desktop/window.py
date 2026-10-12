@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import logging
 import math
 import threading
 import time
@@ -27,6 +28,9 @@ from .recognition import ASRSession
 from .settings import CACHE, DATA, ROOT, TEMP, Settings
 from .timeline import CaptionCache, Timeline, browser_identity, cue_key, file_identity
 from .translation import detect_target
+
+
+LOG = logging.getLogger(__name__)
 
 
 STYLE = """
@@ -162,7 +166,7 @@ class MainWindow(QMainWindow):
         hint = QLabel("本地与网页视频 · 中英互译 · 自由拖动的桌面字幕")
         hint.setObjectName("subtitle")
         layout.addWidget(hint)
-        self.status = QLabel("准备就绪 · 选择声音来源后开始")
+        self.status = QLabel("准备就绪 · 选择视频后开始")
         self.status.setObjectName("status")
         self.status.setWordWrap(True)
         layout.addWidget(self.status)
@@ -200,7 +204,7 @@ class MainWindow(QMainWindow):
         form.addRow("语音识别", self.model)
         form.addRow("计算设备", self.device)
         form.addRow("中英互译", self.engine)
-        form.addRow("当前模型", self.model_info)
+        form.addRow("当前处理", self.model_info)
         for box in (self.model, self.device, self.engine):
             box.currentIndexChanged.connect(self._save_engine)
         left.addWidget(engine_group)
@@ -489,22 +493,30 @@ class MainWindow(QMainWindow):
         self._last_video = dict(video, received_at=time.monotonic())
         self._buffer.set_duration(video.get("duration"))
         self._restore_cache()
+        self._request_browser_captions(video)
+
+    def _request_browser_captions(self, video, attempt=0):
+        # Text retrieval errors never prove that a video has no subtitles.
+        # Keep recognition blocked until the page confirms an absent track.
+        self._recognition_blocked = True
         context = dict(generation=self.generation, identity=self.identity, tab=self._bound_tab,
-                       video=dict(video), request_id=None)
+                       video=dict(video), request_id=None, attempt=attempt, started=time.monotonic())
         self._caption_context = context
+        self.model_info.setText("网页原字幕优先")
         self._status("正在读取网页原字幕 · 有字幕时直接翻译")
+        LOG.info("caption_request generation=%s platform=%s attempt=%s connector=%s",
+                 self.generation, video.get("platform"), attempt, video.get("connector_version", "unknown"))
         try:
             request_id = self.bridge.request_captions(video, generation=self.generation)
             if self._caption_context is context:
                 context["request_id"] = request_id
-        except Exception as error:
+        except Exception:
             if self._caption_context is context:
-                self._caption_context = None
-                self._fallback_browser_audio(video, f"网页原字幕读取失败：{error}")
+                self._caption_read_failed(context, "error", "bridge_unavailable")
 
     def _browser_captions(self, event):
         context = self._caption_context
-        if (context is None or self.mode != "browser" or self._closing
+        if (context is None or context.get("finished") or self.mode != "browser" or self._closing
                 or context["generation"] != self.generation
                 or event.get("generation") != self.generation
                 or context["identity"] != self.identity
@@ -519,19 +531,57 @@ class MainWindow(QMainWindow):
                 or self._last_video.get("document_start", 0) != expected.get("document_start", 0)
                 or browser_identity(self._last_video) != context["identity"]):
             return
-        if event.get("status") == "ready" and event.get("cues"):
+        status = event.get("status")
+        LOG.info("caption_result generation=%s platform=%s status=%s cues=%s elapsed_ms=%s error_code=%s",
+                 self.generation, expected.get("platform"), status, len(event.get("cues") or []),
+                 round((time.monotonic() - context["started"]) * 1000), event.get("error_code", ""))
+        if status == "ready" and event.get("cues"):
+            context["finished"] = True
             context["ready"] = True
             self._install_native(event["cues"], event.get("source_language", ""))
-        elif not context.get("ready"):
+        elif status == "unavailable" and event.get("native_track_available") is False:
+            context["finished"] = True
             self._caption_context = None
-            status = event.get("status")
-            reason = "视频没有可用原字幕" if status == "unavailable" else "原字幕未能取得"
-            self._fallback_browser_audio(context["video"], reason)
+            self._recognition_blocked = False
+            self._fallback_browser_audio(context["video"], "网站确认没有可用原字幕")
+        else:
+            self._caption_read_failed(context, status, event.get("error_code", ""))
+
+    def _caption_read_failed(self, context, status, error_code=""):
+        context.update(finished=True, failed=True)
+        self._recognition_blocked = True
+        LOG.info("caption_read_failed generation=%s status=%s error_code=%s attempt=%s",
+                 self.generation, status, error_code, context["attempt"])
+        reason = {
+            "bili_metadata_failed": "未能读取 B 站字幕列表",
+            "bili_track_failed": "已找到 B 站字幕，但正文读取失败",
+            "observer_unavailable": "网页字幕连接未就绪",
+            "bridge_unavailable": "浏览器字幕连接已断开",
+            "video_changed": "网页视频已切换",
+        }.get(error_code, "等待原字幕超时" if status == "timeout" else "原字幕读取未完成")
+        if context["attempt"] == 0 and error_code not in {"observer_unavailable", "video_changed", "bridge_unavailable"}:
+            self._status(reason + " · 正在重试原字幕")
+            QTimer.singleShot(800, lambda: self._retry_browser_captions(context))
+        else:
+            self.model_info.setText("原字幕读取失败 · 语音识别未启动")
+            self._status(reason + " · 点击“重试未完成字幕”；更新扩展后请重新加载并刷新网页。")
+
+    def _retry_browser_captions(self, context):
+        current = self._last_video
+        if (self._caption_context is not context or self.mode != "browser" or self._closing
+                or context["generation"] != self.generation or current is None
+                or browser_identity(current) != context["identity"]
+                or current.get("document_start", 0) != context["video"].get("document_start", 0)):
+            return
+        self._request_browser_captions(current, attempt=context["attempt"] + 1)
 
     def _fallback_browser_audio(self, video, reason):
+        LOG.info("audio_fallback generation=%s platform=%s reason=confirmed_no_native_track",
+                 self.generation, video.get("platform"))
         if self._source_complete:
             self._status("已加载缓存字幕，正在跟随网页播放进度。")
             return
+        self.model_info.setText("无可用原字幕 · 将使用语音识别")
         directory = TEMP / ("web-" + uuid.uuid4().hex)
         directory.mkdir(parents=True, exist_ok=True)
         self._pending_download = dict(generation=self.generation, video=dict(video), directory=str(directory),
@@ -569,6 +619,8 @@ class MainWindow(QMainWindow):
         if self._source_kind != "native":
             self.timeline.clear()
         self._source_kind, self._source_complete = "native", True
+        self.model_info.setText("原字幕模式 · 无需语音识别")
+        LOG.info("native_installed generation=%s cues=%s", self.generation, len(cues))
         prepared = []
         for cue in cues:
             source, target = detect_target(cue["text"], cue.get("source_language") or language)
@@ -747,6 +799,9 @@ class MainWindow(QMainWindow):
         try:
             cut = (dict(start_seconds=item["window"][0], duration_seconds=item["window"][1] - item["window"][0])
                    if item.get("window") else {})
+            LOG.info("asr_submit generation=%s mode=%s model=%s start=%s duration=%s",
+                     self.generation, self.mode, item.get("options", self._source_config).get("model"),
+                     cut.get("start_seconds", 0), cut.get("duration_seconds", "full"))
             accepted = self.asr.submit(item["source"], item["job_id"], offset_seconds=item["offset"],
                                        **cut, **item.get("options", self._source_config))
         except Exception as error:
@@ -768,13 +823,14 @@ class MainWindow(QMainWindow):
 
     def _asr_event(self, event):
         kind = event.get("event")
-        if kind == "model" and not self._closing:
-            self.model_info.setText(f"{event.get('model', self.model.currentText())} · {event.get('device', self.device.currentText())}")
         task = self._active
         if task is None or event.get("job_id") != task["job_id"]:
             return
         current = (task["generation"] == self.generation and not self._closing
                    and not (task.get("window") and self._source_kind == "native"))
+        if current and kind == "model":
+            self.model_info.setText(f"{event.get('model', self.model.currentText())} · {event.get('device', self.device.currentText())}")
+            LOG.info("asr_model_loaded generation=%s model=%s", self.generation, self._source_config.get("model"))
         if current and kind == "state":
             message = event.get("message") or event.get("status")
             if message:
@@ -819,6 +875,7 @@ class MainWindow(QMainWindow):
         if (event["generation"] != self.generation or self._closing
                 or event.get("epoch", epoch) != epoch):
             return
+        LOG.info("translation_result generation=%s cues=%s", self.generation, len(event["cues"]))
         self.timeline.update_translations(event["cues"])
         self._displayed_key = None
         self._render_history()
@@ -833,6 +890,9 @@ class MainWindow(QMainWindow):
             self._status("翻译失败，原文已保留：" + event["message"])
 
     def retry_translation(self):
+        if self.mode == "browser" and self._caption_context and self._caption_context.get("failed"):
+            self._retry_browser_captions(self._caption_context)
+            return
         self._recognition_blocked = False
         self._drive_buffer()
         cues = [c for c in self.timeline.cues if not c.get("translation")]

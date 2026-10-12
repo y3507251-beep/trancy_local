@@ -8,6 +8,8 @@
   const tabSequences = new Map();
   const running = new Set();
   const captionRequests = new Map();
+  const captionErrorCodes = new Set(["bili_metadata_failed", "bili_track_failed", "youtube_metadata_failed", "youtube_track_failed",
+    "observer_unavailable", "video_changed", "invalid_caption_payload", "bridge_upload_failed"]);
   const clientId = crypto.randomUUID();
   let session = "", timer = null, ticking = false, lastKeepalive = 0, api = null;
 
@@ -101,7 +103,7 @@
     const entry = videos.get(job.tab_id);
     if (!entry || !sameCaptionVideo(entry.video, job.video) || entry.documentStart !== job.document_start) {
       await post("/v1/captions", {id: job.id, tab_id: job.tab_id, video: job.video,
-        document_start: job.document_start, status: "error"}).catch(() => {});
+        document_start: job.document_start, status: "error", error_code: "video_changed"}).catch(() => {});
       return;
     }
     captionRequests.set(job.id, {...job, started: Date.now()});
@@ -113,7 +115,7 @@
     } catch (_) {
       captionRequests.delete(job.id);
       await post("/v1/captions", {id: job.id, tab_id: job.tab_id, video: job.video,
-        document_start: job.document_start, status: "error"}).catch(() => {});
+        document_start: job.document_start, status: "error", error_code: "observer_unavailable"}).catch(() => {});
     }
   }
 
@@ -126,16 +128,19 @@
     captionRequests.delete(job.id);
     const base = {id: job.id, tab_id: job.tab_id, video: job.video, document_start: job.document_start};
     if (message.status === "unavailable" || message.status === "error") {
-      await post("/v1/captions", {...base, status: message.status}).catch(() => {});
+      const diagnostic = {};
+      if (captionErrorCodes.has(message.error_code)) diagnostic.error_code = message.error_code;
+      if (typeof message.native_track_available === "boolean") diagnostic.native_track_available = message.native_track_available;
+      await post("/v1/captions", {...base, status: message.status, ...diagnostic}).catch(() => {});
       return;
     }
     if (message.status !== "ready" || !Array.isArray(message.cues) || !message.cues.length || message.cues.length > 20000) {
-      await post("/v1/captions", {...base, status: "error"}).catch(() => {});
+      await post("/v1/captions", {...base, status: "error", error_code: "invalid_caption_payload"}).catch(() => {});
       return;
     }
     // Only public subtitle text/times are forwarded. Even a spoofed page event
     // cannot smuggle its fetch headers, signed URLs or unrelated JSON fields.
-    const chunks = []; let chunk = [], size = 0;
+    const chunks = []; let chunk = [], size = 0, failureCode = "invalid_caption_payload";
     try {
       for (const raw of message.cues) {
         if (!raw || typeof raw.text !== "string" || !raw.text.trim() || raw.text.length > 16000 ||
@@ -160,16 +165,18 @@
       }
       if (chunk.length) chunks.push(chunk);
       if (chunks.length > 256) throw new Error("large track");
+      failureCode = "bridge_upload_failed";
       for (let i = 0; i < chunks.length; i++) {
         const current = videos.get(job.tab_id);
         if (!current || current.documentStart !== job.document_start || !sameCaptionVideo(current.video, job.video)) return;
         const reply = await post("/v1/captions", {...base, status: "ready", part: i, part_count: chunks.length, cues: chunks[i],
+          native_track_available: true,
           source_language: String(message.source_language || "").slice(0, 32),
           caption_source: ["youtube-human", "youtube-asr", "bilibili-human", "bilibili-asr"].includes(message.caption_source) ? message.caption_source : ""});
         if (reply.accepted === false) return; // Stopped/replaced request: no remaining text uploads.
       }
     } catch (_) {
-      await post("/v1/captions", {...base, status: "error"}).catch(() => {});
+      await post("/v1/captions", {...base, status: "error", error_code: failureCode}).catch(() => {});
     }
   }
 
@@ -189,7 +196,7 @@
     ticking = true;
     let connected = false;
     try {
-      if (!session) session = (await post("/v1/hello", {}, false)).session;
+      if (!session) session = (await post("/v1/hello", {connector_version: chrome.runtime.getManifest().version || ""}, false)).session;
       const reply = await post("/v1/poll", {});
       connected = true;
       for (const job of reply.jobs || []) void translateJob(job);
@@ -205,7 +212,7 @@
       if (now - lastKeepalive > 20000) {
         lastKeepalive = now;
         // Only while a desktop app is connected. A Chrome API event keeps this
-        // MV3 worker available for system-audio translations without a video tab.
+        // MV3 worker available for pending video subtitles and translations.
         await chrome.runtime.getPlatformInfo();
       }
     } catch (_) {
