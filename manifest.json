@@ -39,6 +39,17 @@
       }
    },
    "content_scripts": [ {
+      "all_frames": false,
+      "js": [ "assets/desktop-bridge-page.js" ],
+      "matches": [ "https://youtube.com/*", "https://www.youtube.com/*", "https://m.youtube.com/*", "https://www.youtube-nocookie.com/*", "https://bilibili.com/*", "https://*.bilibili.com/*" ],
+      "run_at": "document_start",
+      "world": "MAIN"
+   }, {
+      "all_frames": false,
+      "js": [ "assets/desktop-bridge-content.js" ],
+      "matches": [ "https://youtube.com/*", "https://www.youtube.com/*", "https://m.youtube.com/*", "https://www.youtube-nocookie.com/*", "https://bilibili.com/*", "https://*.bilibili.com/*" ],
+      "run_at": "document_start"
+   }, {
       "all_frames": true,
       "css": [ "assets/edvideo.css" ],
       "js": [ "assets/edvideo-onload.js" ],
@@ -68,7 +79,7 @@
    "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEApsZDNlPHcZCrwXDZY4XJkwF0DHR7TCTahUYQ8PUbF+KycXn1f+zjvAm9Cs0RHo5A8z7wMgN7QnuPgILtGHMmaJ4TdC4GC0WEgFmSlzo23Yb0OiEdHQK3J9i4qbQLfz73uEldhLlssF/yZpcvzymj6NhTmSkkcSDhtzSNbGU9Kkn9fmX4W2Uqsp5ZUvYadpxf/ZQJ5MwezkVZad1Ocfr+wq2dJYaEXkgfMoaO2YADkvFCBm9qd9jgU7KZh6UWmyIz/cYx0HZEXhl4REUx8J/1Tnxf/0T+wxX7KQqZwPS1hN8nGXIMuaudG8ODyzKdqlAB74J9oMx/M5Fz3/eFrL0MoQIDAQAB",
    "manifest_version": 3,
    "name": "__MSG_PKG_NAME__",
-   "permissions": [ "storage", "contextMenus", "unlimitedStorage" ],
+   "permissions": [ "storage", "contextMenus", "unlimitedStorage", "alarms" ],
    "update_url": "https://clients2.google.com/service/update2/crx",
    "version": "7.9.4",
    "web_accessible_resources": [ {

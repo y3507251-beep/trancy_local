@@ -1,0 +1,73 @@
+{
+  "checked_date": "2026-10-13",
+  "timezone": "Asia/Shanghai",
+  "controlled_tests": {
+    "command": "python -B -m unittest discover -s desktop/tests -p test_browser_translation.py -v",
+    "passed": 12,
+    "scope": [
+      "Bilibili BV / CID / part and YouTube video identity validation",
+      "Allowlisted page/media URLs; rejection of credentials, custom ports and other domains",
+      "Loopback bridge Origin, custom header and per-session checks",
+      "Per-tab state, monotonic sequence rejection and stale state expiration",
+      "Queued translation round trip and sanitized error handling",
+      "Real JavaScript background module in a mocked Chrome API environment",
+      "Configured subtitle engine and token passed only to the existing Cl executor",
+      "No provider key or account token in localhost payloads",
+      "Real MAIN observer JavaScript in a mocked page environment",
+      "Late Bilibili responses after part switches and mismatching YouTube player responses rejected",
+      "Live flag forwarded through page/background/Python; active streams refused by both download entry and extractor"
+    ]
+  },
+  "real_translation_requests": [
+    {
+      "provider": "Plugin built-in Google implementation",
+      "source_language": "en",
+      "target_language": "zh-CN",
+      "input": "Hello, welcome to the desktop subtitle app.",
+      "output": "您好，欢迎使用桌面字幕应用程序。"
+    },
+    {
+      "provider": "Plugin built-in Google implementation",
+      "source_language": "zh-CN",
+      "target_language": "en",
+      "input": "这是一个中英文双语字幕测试。",
+      "output": "This is a test with Chinese and English subtitles."
+    }
+  ],
+  "real_audio_downloads": [
+    {
+      "platform": "bilibili",
+      "video_id": "BV1PPQzByEAC",
+      "page": 1,
+      "adapter": "Existing SubtitleService service.bilibili",
+      "downloaded_bytes": 7770282,
+      "decoded_duration_seconds": 496.094331,
+      "codec": "aac",
+      "sample_rate": 44100,
+      "channels": 2,
+      "result": "Downloaded full media; PyAV opened and decoded an audio frame"
+    },
+    {
+      "platform": "youtube",
+      "video_id": "jNQXAC9IVRw",
+      "adapter": "Shared yt-dlp 2026.08.19 followed by allowlisted full HTTP audio download",
+      "downloaded_bytes": 309288,
+      "decoded_duration_seconds": 19.063583,
+      "codec": "aac",
+      "sample_rate": 44100,
+      "channels": 2,
+      "result": "Downloaded full media; PyAV opened and decoded an audio frame"
+    }
+  ],
+  "failed_probe": {
+    "platform": "youtube",
+    "video_id": "BaW_jenozKc",
+    "result": "Extractor failed; this probe is not included in successful download results"
+  },
+  "validation_boundaries": [
+    "This file does not claim a live Chrome page-to-desktop bridge test.",
+    "The configured plugin engine path was exercised with a mocked engine in JavaScript; the real network checks used the standalone identical Google implementation.",
+    "Audio download success does not by itself claim an ASR or synchronized subtitle display test.",
+    "No browser cookies, account tokens, provider keys or signed media URLs are stored in this record."
+  ]
+}

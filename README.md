@@ -4,6 +4,14 @@ Chrome Manifest V3 扩展，提供 AI 翻译、双语字幕及语言学习功能
 
 本 README 记录当前 **7.9.4** 代码中 YouTube 原字幕与 AI 转录的完整调用链，供后续维护和 B 站无字幕视频接入使用。
 
+## Windows 桌面字幕
+
+新增 [PyQt6 桌面应用](desktop/README.md)，提供系统声音分段实时翻译、**PotPlayer** 本地视频字幕，以及 B 站 / YouTube 网页视频取音识别。桌面字幕可置顶、跨窗口拖动，并显示中英双语；本地播放器只适配 PotPlayer。
+
+桌面端复用 `D:\dev\SubtitleService` 的本地识别模型，翻译沿用插件的 Google 实现或通过浏览器桥接调用插件当前字幕引擎。桌面端生成字幕不要求原视频已有字幕。下文关于 `api.trancy.org` 的说明仍指原扩展的云端转录流程。
+
+当前电脑可双击 [启动桌面字幕.vbs](desktop/启动桌面字幕.vbs)。安装、浏览器扩展运行副本与验证情况见 [桌面使用说明](desktop/README.md)。
+
 ## 1. 文档依据与适用范围
 
 - 核对日期：2026-10-13，Asia/Shanghai。
