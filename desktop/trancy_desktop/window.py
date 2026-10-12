@@ -239,6 +239,7 @@ class MainWindow(QMainWindow):
         web_layout.addWidget(self.follow_web)
         web_layout.addWidget(self._button("生成所选网页视频双语字幕", self.start_browser, True))
         self.tabs.addTab(web, "B 站 / YouTube")
+        self.tabs.setCurrentWidget(web)
 
         controls = QHBoxLayout()
         controls.addWidget(self._button("停止当前任务", self.stop))
