@@ -23,7 +23,7 @@ from PyQt6.QtWidgets import QApplication
 
 from trancy_desktop import window as controller
 from trancy_desktop.settings import DEFAULTS
-from trancy_desktop.timeline import Timeline, browser_identity
+from trancy_desktop.timeline import Timeline, browser_identity, file_identity
 
 
 # unittest discovery imports this module before running QCoreApplication tests.
@@ -60,9 +60,21 @@ class FakeOverlay(QObject):
     def __init__(self, settings):
         super().__init__()
         self.last = ("", "")
+        self.cue = None
+        self.position = None
+        self.position_history = []
 
-    def show_caption(self, original, translation=""):
+    def show_caption(self, original, translation="", *, source_language=""):
         self.last = (original, translation)
+
+    def show_cue(self, cue, position=None):
+        self.cue = cue
+        self.last = (cue.get("text", ""), cue.get("translation", "")) if cue else ("", "")
+        self.set_position(position)
+
+    def set_position(self, position):
+        self.position = position
+        self.position_history.append(position)
 
     def preview(self):
         self.last = ("preview", "preview")
@@ -441,6 +453,99 @@ class ControllerTests(unittest.TestCase):
                        "cues": [{**cues[0], "translation": "大家好。"}, {**cues[1], "translation": "欢迎测试。"}]})
         self.assertEqual(w._latest_live["translation"], "大家好。 欢迎测试。")
 
+    def test_same_potplayer_cue_receives_each_new_playback_position(self):
+        w = self.window
+        source = str(Path(__file__).resolve())
+        w.mode, w.identity = "potplayer", file_identity(source)
+        w.pot.state.update(connected=True, path=source, position=1, paused=False, rate=1)
+        w.timeline.add([{"start": 0, "end": 10, "text": "We learn English.", "translation": "我们学英语。"}])
+        w._tick()
+        self.assertEqual(w.overlay.position, 1)
+        w.pot.state["position"] = 2
+        w._tick()
+        self.assertEqual(w.overlay.position, 2,
+                         "Word progress must refresh while the sentence text stays unchanged")
+        self.assertEqual(w.overlay.cue["text"], "We learn English.")
+
+    def test_paused_potplayer_and_backward_seek_use_actual_player_clock(self):
+        w = self.window
+        source = str(Path(__file__).resolve())
+        w.mode, w.identity = "potplayer", file_identity(source)
+        w.pot.state.update(connected=True, path=source, position=4, paused=True, rate=2, updated_at=100)
+        w.timeline.add([{"start": 0, "end": 10, "text": "We learn English.", "translation": "我们学英语。"}])
+        with patch.object(controller.time, "monotonic", return_value=200), patch.object(controller.time, "time", return_value=200):
+            w._tick()
+        self.assertEqual(w.overlay.position, 4)
+        w.pot.state["position"] = 1
+        w._tick()
+        self.assertEqual(w.overlay.position, 1)
+
+    def test_browser_clock_uses_reported_rate_and_freezes_when_paused(self):
+        w = self.window
+        current = dict(video(), position=1, paused=False, rate=2)
+        w.mode, w.identity = "browser", browser_identity(current)
+        w._last_video = dict(current, received_at=100)
+        w.timeline.add([{"start": 0, "end": 10, "text": "We learn English.", "translation": "我们学英语。"}])
+        with patch.object(controller.time, "monotonic", return_value=100.4):
+            w._tick()
+        self.assertAlmostEqual(w.overlay.position, 1.8)
+        w._last_video["paused"] = True
+        with patch.object(controller.time, "monotonic", return_value=101):
+            w._tick()
+        self.assertEqual(w.overlay.position, 1)
+
+    def test_live_combined_sentence_keeps_all_audio_word_metadata(self):
+        w = self.window
+        w._new_source("live", "live-test", "test")
+        first = {"start": 4, "end": 5, "text": "Hello everyone.", "_job_id": "current",
+                 "words": [{"start": 4.1, "end": 4.3, "text": "Hello"},
+                           {"start": 4.4, "end": 4.9, "text": "everyone."}]}
+        second = {"start": 5, "end": 8, "text": "Welcome to the test.", "_job_id": "current",
+                  "words": [{"start": 5.1, "end": 5.5, "text": "Welcome"},
+                            {"start": 5.6, "end": 5.9, "text": "to"},
+                            {"start": 6, "end": 6.1, "text": "the"},
+                            {"start": 6.2, "end": 6.6, "text": "test."}]}
+        w.timeline.add([first, second])
+        w._refresh_live_caption()
+        self.assertEqual(w._latest_live["words"], first["words"] + second["words"])
+
+    def test_live_word_progress_replays_returned_chunk_on_a_delayed_clock(self):
+        w = self.window
+        w._new_source("live", "live-test", "test")
+        cue = {"start": 4, "end": 8, "text": "Hello everyone.", "translation": "大家好。",
+               "source_language": "en", "_job_id": "current"}
+        w.timeline.add([cue])
+        with patch.object(controller.time, "monotonic", return_value=100):
+            w._live_received = 100
+            w._refresh_live_caption()
+            w._tick()
+        self.assertEqual(w.overlay.position, 4,
+                         "ASR arrival starts delayed caption playback, not a claim to the current system-audio position")
+        with patch.object(controller.time, "monotonic", return_value=101.5):
+            w._tick()
+        self.assertAlmostEqual(w.overlay.position, 5.5)
+        with patch.object(controller.time, "monotonic", return_value=105):
+            w._tick()
+        self.assertEqual(w.overlay.position, 8)
+
+    def test_live_chinese_chunk_waits_for_english_translation_before_word_replay(self):
+        w = self.window
+        w._new_source("live", "live-test", "test")
+        cue = {"start": 4, "end": 8, "text": "大家好。", "source_language": "zh", "_job_id": "current"}
+        w.timeline.add([cue])
+        with patch.object(controller.time, "monotonic", return_value=100):
+            w._live_received = 100
+            w._refresh_live_caption()
+            w._tick()
+        self.assertIsNone(w.overlay.position)
+        with patch.object(controller.time, "monotonic", return_value=102):
+            w._translated({"generation": w.generation, "cues": [{**cue, "translation": "Hello everyone."}]})
+            w._tick()
+        self.assertEqual(w.overlay.position, 4)
+        with patch.object(controller.time, "monotonic", return_value=103):
+            w._tick()
+        self.assertEqual(w.overlay.position, 5)
+
 
 class TimelineIntegrationTests(unittest.TestCase):
     def test_translation_updates_same_cue_in_place_without_duplicate(self):
@@ -475,6 +580,27 @@ class TimelineIntegrationTests(unittest.TestCase):
         self.assertEqual(added, [])
         self.assertEqual(timeline.at(1)["translation"], "你好")
 
+    def test_same_cue_can_receive_word_alignment_after_initial_text(self):
+        timeline = Timeline()
+        cue = {"start": 0, "end": 2, "text": "hello there", "_job_id": "job"}
+        words = [{"start": .2, "end": .7, "text": "hello"}, {"start": .8, "end": 1.4, "text": "there"}]
+        timeline.add([cue])
+        timeline.add([{**cue, "words": words, "timing_source": "whisper"}])
+        self.assertEqual(timeline.at(1)["words"], words)
+        self.assertEqual(timeline.at(1)["timing_source"], "whisper")
+
+    def test_late_translation_keeps_current_audio_word_alignment(self):
+        timeline = Timeline()
+        cue = {"start": 0, "end": 2, "text": "hello there", "_job_id": "job"}
+        old = [{"start": 0, "end": .7, "text": "hello"}]
+        current = [{"start": .2, "end": .7, "text": "hello"}, {"start": .8, "end": 1.4, "text": "there"}]
+        timeline.add([{**cue, "words": current, "timing_source": "whisper"}])
+        timeline.update_translations([{**cue, "words": old, "translation": "你们好", "source_language": "en",
+                                      "target_language": "zh", "timing_source": "cue"}])
+        self.assertEqual(timeline.at(1)["words"], current)
+        self.assertEqual(timeline.at(1)["timing_source"], "whisper")
+        self.assertEqual(timeline.at(1)["translation"], "你们好")
+
 
 def live_integration(source: str) -> dict:
     """Opt-in real MainWindow -> PotPlayer -> SubtitleService -> Google test.
@@ -491,6 +617,7 @@ def live_integration(source: str) -> dict:
         POT_GET_TOTAL_TIME,
     )
     from trancy_desktop.settings import Settings
+    from trancy_desktop.translation import detect_target
 
     # The Windows offscreen Qt backend has no automatic font discovery. Load
     # genuine installed fonts for faithful test renders; production uses Qt's
@@ -567,19 +694,23 @@ def live_integration(source: str) -> dict:
         report["snapshots"] = []
         for index, cue in enumerate((window.timeline.cues[0], window.timeline.cues[-1]), 1):
             target = (cue["start"] + cue["end"]) / 2
+            source_language = cue.get("source_language") or detect_target(cue["text"])[0]
+            english, chinese = ((cue["translation"], cue["text"]) if source_language.startswith("zh")
+                                else (cue["text"], cue["translation"]))
             if not window.pot.seek(target):
                 raise AssertionError("PotPlayer rejected seek")
             spin(lambda: window.pot.snapshot().get("position") is not None
                  and abs(window.pot.snapshot()["position"] - target) < .4, 5, "seek subtitle " + str(index))
-            spin(lambda: window.overlay.primary.text() == cue["text"] and window.overlay.secondary.text() == cue["translation"],
+            spin(lambda: window.overlay.english.text() == english and window.overlay.chinese.text() == chinese,
                  5, "synchronize bilingual overlay " + str(index))
             state = window.pot.snapshot()
             assert state["paused"] is True, state
             assert window.overlay.isVisible(), "Non-empty enabled subtitles should be visible"
             image_path = artifact / f"overlay-{index}.png"
             assert window.overlay.grab().save(str(image_path))
-            report["snapshots"].append({"position": state["position"], "original": window.overlay.primary.text(),
-                                        "translation": window.overlay.secondary.text(), "image": str(image_path)})
+            report["snapshots"].append({"position": state["position"], "original": cue["text"],
+                                        "translation": cue["translation"], "english": window.overlay.english.text(),
+                                        "chinese": window.overlay.chinese.text(), "image": str(image_path)})
         screenshot = artifact / "settings-complete.png"
         assert window.grab().save(str(screenshot))
         report["settings_screenshot"] = str(screenshot)

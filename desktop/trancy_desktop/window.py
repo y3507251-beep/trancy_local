@@ -12,7 +12,7 @@ from PyQt6.QtGui import QAction, QColor, QIcon
 from PyQt6.QtWidgets import (
     QCheckBox, QColorDialog, QComboBox, QFileDialog, QFormLayout, QGroupBox,
     QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox, QProgressBar,
-    QPushButton, QSlider, QSpinBox, QSplitter, QSystemTrayIcon, QTabWidget,
+    QPushButton, QSlider, QSpinBox, QSplitter, QSystemTrayIcon, QTabWidget, QScrollArea,
     QTextEdit, QVBoxLayout, QWidget, QMenu,
 )
 
@@ -25,6 +25,7 @@ from .potplayer import PotPlayerAdapter
 from .recognition import ASRSession
 from .settings import CACHE, DATA, ROOT, TEMP, Settings
 from .timeline import CaptionCache, Timeline, browser_identity, cue_key, file_identity
+from .translation import detect_target
 
 
 STYLE = """
@@ -86,6 +87,8 @@ class MainWindow(QMainWindow):
         self._source_complete = False
         self._latest_live = None
         self._live_received = 0.0
+        self._live_started = None
+        self._live_clock_job = None
         self._displayed_key = None
         self._last_video = None
         self._bound_tab = None
@@ -162,9 +165,16 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.status)
         split = QHBoxLayout()
         left = QVBoxLayout()
-        right = QVBoxLayout()
+        right_panel = QWidget()
+        right_panel.setObjectName("appearancePanel")
+        right = QVBoxLayout(right_panel)
+        right.setContentsMargins(0, 0, 0, 0)
+        right_scroll = QScrollArea()
+        right_scroll.setWidgetResizable(True)
+        right_scroll.setStyleSheet("QScrollArea { border: none; background: transparent; } QWidget#appearancePanel { background: #10121a; }")
+        right_scroll.setWidget(right_panel)
         split.addLayout(left, 7)
-        split.addLayout(right, 4)
+        split.addWidget(right_scroll, 4)
         layout.addLayout(split, 1)
 
         engine_group = QGroupBox("识别与翻译")
@@ -271,9 +281,23 @@ class MainWindow(QMainWindow):
         self.locked.toggled.connect(self._lock_overlay)
         appearance_form.addRow(self.overlay_visible)
         appearance_form.addRow(self.locked)
+        self.caption_order = QComboBox()
+        for title, value in (("英文在上 · 中文在下（默认）", "english_first"),
+                             ("中文在上 · 英文在下", "chinese_first"),
+                             ("原文在上 · 译文在下", "original_first"),
+                             ("译文在上 · 原文在下", "translation_first")):
+            self.caption_order.addItem(title, value)
+        self.caption_order.setCurrentIndex(max(0, self.caption_order.findData(self.settings.get("caption_order"))))
+        self.caption_order.currentIndexChanged.connect(lambda: self._style_changed("caption_order", self.caption_order.currentData()))
+        appearance_form.addRow("字幕顺序", self.caption_order)
+        self.word_follow = QCheckBox("英文逐词点亮")
+        self.word_follow.setChecked(bool(self.settings.get("word_follow", True)))
+        self.word_follow.toggled.connect(lambda value: self._style_changed("word_follow", value))
+        appearance_form.addRow(self.word_follow)
         self.style_controls = {}
-        for label, key, low, high, suffix in (("原文字号", "primary_size", 14, 64, ""),
-                ("译文字号", "secondary_size", 12, 56, ""),
+        for label, key, low, high, suffix in (("英文字号", "primary_size", 14, 64, ""),
+                ("中文字号", "secondary_size", 12, 56, ""),
+                ("未读词亮度", "unread_brightness", 10, 100, "%"),
                 ("字幕宽度", "overlay_width", 420, 1800, " px"),
                 ("背景不透明度", "opacity", 0, 100, "%")):
             widget = QSpinBox()
@@ -283,8 +307,8 @@ class MainWindow(QMainWindow):
             widget.valueChanged.connect(lambda value, k=key: self._style_changed(k, value))
             self.style_controls[key] = widget
             appearance_form.addRow(label, widget)
-        appearance_form.addRow("原文颜色", self._button("选择颜色", lambda: self._choose_color("primary_color")))
-        appearance_form.addRow("译文颜色", self._button("选择颜色", lambda: self._choose_color("secondary_color")))
+        appearance_form.addRow("英文颜色", self._button("选择颜色", lambda: self._choose_color("primary_color")))
+        appearance_form.addRow("中文颜色", self._button("选择颜色", lambda: self._choose_color("secondary_color")))
         appearance_form.addRow(self._button("预览并调整字幕位置", self._preview))
         note = QLabel("解锁后拖动字幕即可移动位置。\n设置窗口可最小化，字幕仍然显示。")
         note.setObjectName("subtitle")
@@ -382,6 +406,8 @@ class MainWindow(QMainWindow):
         self._displayed_key = None
         self._latest_live = None
         self._live_received = 0.0
+        self._live_started = None
+        self._live_clock_job = None
         self.history.clear()
         self.overlay.show_caption("")
         self.settings.update(service_root=self.service_root.text().strip(),
@@ -639,7 +665,9 @@ class MainWindow(QMainWindow):
             if message:
                 self._status(message)
         if current and kind in ("cues", "result"):
-            cues = [dict(cue, _job_id=task["job_id"]) for cue in event.get("cues", [])]
+            cues = [dict(cue, _job_id=task["job_id"],
+                         source_language=detect_target(cue["text"], event.get("detected_language", ""))[0])
+                    for cue in event.get("cues", [])]
             if kind == "result" or event.get("reset_cues"):
                 added = self.timeline.replace_job(task["job_id"], cues)
             else:
@@ -683,15 +711,27 @@ class MainWindow(QMainWindow):
     def _refresh_live_caption(self):
         if not self.timeline.cues:
             self._latest_live = None
+            self._live_started = None
+            self._live_clock_job = None
             return
         latest = self.timeline.cues[-1]
         # A short chunk can produce several cues at once. Show the entire chunk
         # so earlier words are not lost just because inference returned quickly.
         job = latest.get("_job_id")
         cues = [c for c in self.timeline.cues if c.get("_job_id") == job] if job else [latest]
+        source = latest.get("source_language") or detect_target(latest["text"])[0]
         self._latest_live = dict(start=cues[0]["start"], end=cues[-1]["end"], _job_id=job,
                                  text=" ".join(c["text"] for c in cues),
-                                 translation=" ".join(c["translation"] for c in cues if c.get("translation")))
+                                 translation=" ".join(c["translation"] for c in cues if c.get("translation")),
+                                 source_language=source, words=[w for c in cues for w in (c.get("words") or [])],
+                                 timing_source=latest.get("timing_source", "cue"))
+        clock_job = job or (cues[0]["start"], cues[-1]["end"])
+        if clock_job != self._live_clock_job:
+            self._live_clock_job = clock_job
+            self._live_started = None
+        english_ready = not str(source).startswith("zh") or bool(self._latest_live["translation"])
+        if english_ready and self._live_started is None:
+            self._live_started = time.monotonic()
 
     def _translation_error(self, event):
         if event["generation"] == self.generation:
@@ -728,14 +768,18 @@ class MainWindow(QMainWindow):
         self._start_pending_capture()
         self._start_pending_download()
         cue = None
+        position = None
         if self.mode == "live":
             if time.monotonic() - self._live_received < 10:
                 cue = self._latest_live
+                if cue and self._live_started is not None:
+                    position = min(cue["end"], cue["start"] + max(0, time.monotonic() - self._live_started))
         elif self.mode == "potplayer":
             state = self.pot.snapshot()
             path = state.get("path")
             if state.get("connected") and path and Path(path).is_file() and state.get("position") is not None and file_identity(path) == self.identity:
-                cue = self.timeline.at(float(state["position"]))
+                position = float(state["position"])
+                cue = self.timeline.at(position)
         elif self.mode == "browser" and self._last_video:
             video = self._last_video
             elapsed = time.monotonic() - video["received_at"]
@@ -745,10 +789,16 @@ class MainWindow(QMainWindow):
                 if not video.get("paused", True):
                     position += min(elapsed, 1.5) * float(video.get("rate") or 1)
                 cue = self.timeline.at(position)
-        key = (cue_key(cue), cue.get("translation", "")) if cue else None
+        key = (cue_key(cue), cue.get("translation", ""),
+               tuple((w.get("text"), w.get("start"), w.get("end")) for w in (cue.get("words") or []))) if cue else None
         if key != self._displayed_key:
             self._displayed_key = key
-            self.overlay.show_caption(cue["text"] if cue else "", cue.get("translation", "") if cue else "")
+            if cue:
+                self.overlay.show_cue(cue, position)
+            else:
+                self.overlay.show_caption("")
+        if cue:
+            self.overlay.set_position(position)
 
     def stop(self):
         self.generation += 1
@@ -758,6 +808,8 @@ class MainWindow(QMainWindow):
         self._source_complete = False
         self._bound_tab = None
         self._last_video = None
+        self._live_started = None
+        self._live_clock_job = None
         self._pending_capture = None
         self._capture_dir = None
         if hasattr(self, "capture"):

@@ -12,15 +12,132 @@ import json
 import math
 import os
 import queue
+import re
 import sys
 import threading
 import time
 import traceback
+import unicodedata
 import uuid
 import wave
 from pathlib import Path
+from types import SimpleNamespace
 
 _JOB_HANDLE = None
+
+
+def normalize_timed_cues(cues, duration=None):
+    """Keep the shared service's sentence boundaries and original word times.
+
+    The service's export normalizer deliberately writes only start/end/text.
+    Desktop playback needs the model's words as well; no word timings are
+    invented here when an engine returns only a sentence.
+    """
+    result = []
+    for cue in cues:
+        start, end = float(cue["start"]), float(cue["end"])
+        if not math.isfinite(start) or not math.isfinite(end):
+            raise ValueError("字幕时间必须是有限数字")
+        text = str(cue["text"]).replace("\x00", "").strip()
+        if not text or end <= start:
+            continue
+        start = max(0.0, start)
+        if duration:
+            end = min(end, duration)
+        if end <= start:
+            continue
+        words = []
+        for word in cue.get("words") or []:
+            try:
+                word_start, word_end = float(word["start"]), float(word["end"])
+                word_text = str(word["text"]).replace("\x00", "")
+            except (KeyError, TypeError, ValueError):
+                continue
+            if (not word_text.strip() or not all(math.isfinite(v) for v in (word_start, word_end))
+                    or word_start < 0 or word_end < word_start or word_end < start or word_start >= end):
+                continue
+            words.append(dict(text=word_text, start=round(max(start, word_start), 3),
+                              end=round(min(end, word_end), 3)))
+        words.sort(key=lambda word: (word["start"], word["end"]))
+        result.append(dict(cue, start=round(start, 3), end=round(end, 3), text=text,
+                           words=words, timing_source=cue.get("timing_source", "cue") if words else "cue"))
+    result.sort(key=lambda cue: (cue["start"], cue["end"]))
+    return result
+
+
+def segment_timed_cues(segment, max_chars=42, *, timing_source="whisper"):
+    """Match service.subtitles.segment_cues while retaining its input words."""
+    words = getattr(segment, "words", None)
+    if not words:
+        return [dict(start=segment.start, end=segment.end, text=segment.text.strip(),
+                     words=[], timing_source="cue")]
+    result, group = [], []
+
+    def flush():
+        if group:
+            result.append(dict(start=group[0].start, end=group[-1].end,
+                               text="".join(word.word for word in group).strip(),
+                               words=[dict(text=word.word, start=word.start, end=word.end) for word in group],
+                               timing_source=timing_source))
+            group.clear()
+
+    for word in words:
+        if group and (word.start - group[-1].end > .65 or
+                      len("".join(item.word for item in group)) + len(word.word) > max_chars):
+            flush()
+        group.append(word)
+        if re.search(r"[。！？.!?]$", word.word.strip()):
+            flush()
+    flush()
+    return result
+
+
+def aligned_timed_cues(text, items, offset=0.0, duration=None):
+    """Map Qwen forced-aligner spans to the original transcript, without loss.
+
+    This follows service.qwen_cues.aligned_cues: punctuation stays attached to
+    its original word, and normalization never fabricates evenly spaced times.
+    """
+    def kept(character):
+        return character == "'" or unicodedata.category(character)[0] in ("L", "N")
+
+    normalized, positions = [], []
+    for index, character in enumerate(text):
+        if kept(character):
+            value = unicodedata.normalize("NFKC", character).casefold()
+            normalized.extend(value)
+            positions.extend([index] * len(value))
+    canonical = "".join(normalized)
+    words, cursor, canonical_cursor = [], 0, 0
+    for item in items:
+        token = str(item.text).strip()
+        if not token:
+            continue
+        start, end = float(item.start_time), float(item.end_time)
+        if not all(math.isfinite(v) for v in (start, end)) or start < 0 or end < start:
+            raise ValueError("Invalid forced alignment timestamp")
+        cleaned = "".join(unicodedata.normalize("NFKC", c).casefold() for c in token if kept(c))
+        if not cleaned or not canonical.startswith(cleaned, canonical_cursor):
+            raise ValueError("Forced alignment text does not match transcript")
+        begin = positions[canonical_cursor]
+        canonical_cursor += len(cleaned)
+        finish = positions[canonical_cursor - 1] + 1
+        prefix = text[cursor:begin]
+        if words and prefix.strip():
+            words[-1].word += prefix.rstrip()
+            prefix = prefix[len(prefix.rstrip()):]
+        words.append(SimpleNamespace(word=prefix + text[begin:finish],
+                                     start=offset + start, end=offset + end))
+        cursor = finish
+    if not words:
+        if text.strip():
+            raise ValueError("Nonempty transcript has no word timestamps")
+        return []
+    if canonical_cursor != len(canonical):
+        raise ValueError("Forced alignment omitted transcript words")
+    words[-1].word += text[cursor:]
+    return normalize_timed_cues(segment_timed_cues(SimpleNamespace(words=words),
+                                                  timing_source="qwen_aligner"), duration)
 
 
 def own_process_tree():
@@ -233,6 +350,39 @@ class WhisperEngine(EngineBase):
                 self.emitted_count = len(job["cues"])
                 owner.state(**snapshot)
 
+            def _transcribe(self, job_id, audio, options, device):
+                # The shared service's export helpers discard segment.words.
+                # Keep the same inference settings, model cache and sentence
+                # segmentation here, preserving words only in desktop results.
+                from service.audio import decode_audio
+                model = self.load_model(job_id, options["model"], device)
+                self.update(job_id, status="transcribing", device=device, progress=25,
+                            message="正在逐段识别，生成的字幕会立即出现在预览中")
+                waveform = decode_audio(audio, lambda: self.check_cancel(job_id))
+                kwargs = dict(language=None if options["language"] == "auto" else options["language"],
+                              task="transcribe", vad_filter=True, word_timestamps=True,
+                              beam_size=5, condition_on_previous_text=False)
+                batch_size = options.get("batch_size", 8) if device == "cuda" else 1
+                if batch_size > 1:
+                    from faster_whisper import BatchedInferencePipeline
+                    segments, info = BatchedInferencePipeline(model=model).transcribe(
+                        waveform, batch_size=batch_size, **kwargs)
+                else:
+                    segments, info = model.transcribe(waveform, **kwargs)
+                self.update(job_id, batch_size=batch_size, detected_language=info.language)
+                duration = self.jobs[job_id]["duration"] or info.duration
+                for segment in segments:
+                    self.check_cancel(job_id)
+                    cues = normalize_timed_cues(segment_timed_cues(segment), duration)
+                    with self.lock:
+                        self.check_cancel(job_id)
+                        job = self.jobs[job_id]
+                        job["cues"].extend(cues)
+                        job.update(progress=min(98, 25 + round(segment.end / max(duration, 1) * 73, 1)),
+                                   message=f"已识别至 {int(segment.end) // 60:02d}:{int(segment.end) % 60:02d}",
+                                   updated_at=time.time())
+                        self.save(job)
+
             def load_model(self, job_id, name, device):
                 key = (name, device)
                 previous = self.models.get(key)
@@ -282,7 +432,7 @@ class WhisperEngine(EngineBase):
             self.manager.transcribe("local", audio, options, "cpu")
         self.check()
         job = self.manager.jobs["local"]
-        cues = self.engine.normalize_cues(job["cues"], job["duration"])
+        cues = normalize_timed_cues(job["cues"], job["duration"])
         return dict(cues=cues, no_speech=not bool(cues), duration=job["duration"], model=self.model_name, device=self.device,
                     detected_language=job.get("detected_language", ""), elapsed=round(time.monotonic() - started, 3),
                     worker_pid=os.getpid(), model_instance=self.instance_id, load_count=self.load_count)
@@ -337,7 +487,7 @@ class QwenEngine(EngineBase):
 
     def recognize(self, audio, media, options, device):
         from service.audio import decode_audio
-        from service.qwen_cues import audio_ranges, aligned_cues
+        from service.qwen_cues import audio_ranges
         reused = self.model is not None
         self.load(device)
         self.check()
@@ -370,7 +520,16 @@ class QwenEngine(EngineBase):
             for (start, end), result in zip(current, results):
                 self.check()
                 items = result.time_stamps.items if result.time_stamps else []
-                part = aligned_cues(result.text, items, offset=start / 16000, duration=media["duration"])
+                if items:
+                    part = aligned_timed_cues(result.text, items, offset=start / 16000,
+                                              duration=media["duration"])
+                else:
+                    # A model can return a transcript with no aligner spans.
+                    # Only the audio range is known; leave the words absent so
+                    # the overlay can explicitly use its sentence estimate.
+                    part = normalize_timed_cues([dict(start=start / 16000, end=end / 16000,
+                                                     text=result.text, words=[], timing_source="cue")],
+                                                media["duration"])
                 cues.extend(part)
                 detected = result.language
                 self.state(status="transcribing", new_cues=part, detected_language=detected,

@@ -55,8 +55,14 @@ class Timeline:
             if key not in self._by_key:
                 added.append(cue)
                 self._by_key[key] = dict(cue)
-            elif cue.get("translation"):
-                self._by_key[key].update(cue)
+            else:
+                current = self._by_key[key]
+                for field, value in cue.items():
+                    if field == "translation" and not value:
+                        continue
+                    if field == "words" and not value and current.get("words"):
+                        continue
+                    current[field] = value
         self._index()
         return added
 
@@ -83,7 +89,10 @@ class Timeline:
         for cue in clean_cues(cues):
             key = cue_key(cue)
             if key in self._by_key and cue.get("translation"):
-                self._by_key[key].update(cue)
+                current = self._by_key[key]
+                for field in ("translation", "source_language", "target_language"):
+                    if field in cue:
+                        current[field] = cue[field]
                 updated.append(self._by_key[key])
         return updated
 
@@ -122,7 +131,7 @@ class CaptionCache:
         self.root = root
 
     def _path(self, identity, model, translation_mode):
-        key = json.dumps([identity, model, translation_mode, "zh-en-v1"], ensure_ascii=False)
+        key = json.dumps([identity, model, translation_mode, "zh-en-words-v2"], ensure_ascii=False)
         return self.root / (hashlib.sha256(key.encode("utf-8")).hexdigest() + ".json")
 
     def read(self, identity, model, translation_mode):

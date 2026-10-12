@@ -20,7 +20,7 @@ MODELS = ("small", "large-v3", "qwen3-asr-1.7b")
 
 
 def shifted_cues(cues: list, offset: float) -> list[dict]:
-    """Validate the service's time axis, then shift a live-audio chunk once."""
+    """Validate cue/word seconds, then shift a live-audio chunk exactly once."""
     result = []
     for cue in cues:
         try:
@@ -30,7 +30,21 @@ def shifted_cues(cues: list, offset: float) -> list[dict]:
             continue
         if not (math.isfinite(start) and math.isfinite(end) and end > start >= 0 and text):
             continue
-        result.append(dict(cue, start=round(start + offset, 4), end=round(end + offset, 4), text=text))
+        words = []
+        for word in cue.get("words") or []:
+            try:
+                word_start, word_end = float(word["start"]), float(word["end"])
+                word_text = str(word.get("text", "")).replace("\x00", "")
+            except (KeyError, TypeError, ValueError):
+                continue
+            if (not word_text.strip() or not all(math.isfinite(v) for v in (word_start, word_end))
+                    or word_start < 0 or word_end < word_start or word_end < start or word_start >= end):
+                continue
+            words.append(dict(text=word_text, start=round(max(start, word_start) + offset, 4),
+                              end=round(min(end, word_end) + offset, 4)))
+        words.sort(key=lambda word: (word["start"], word["end"]))
+        result.append(dict(cue, start=round(start + offset, 4), end=round(end + offset, 4), text=text,
+                           words=words, timing_source=cue.get("timing_source", "cue") if words else "cue"))
     return result
 
 
