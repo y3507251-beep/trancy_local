@@ -3,8 +3,8 @@ from __future__ import annotations
 import math
 import time
 
-from PyQt6.QtCore import QEvent, QPointF, QSize, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QColor, QFont, QPainter, QPen, QTextCharFormat, QTextLayout, QTextOption
+from PyQt6.QtCore import QEvent, QPointF, QRect, QSize, Qt, QTimer, pyqtSignal
+from PyQt6.QtGui import QColor, QFont, QPainter, QPen, QRegion, QTextLayout, QTextOption
 from PyQt6.QtWidgets import QApplication, QGraphicsDropShadowEffect, QLabel, QVBoxLayout, QWidget
 
 from .caption_words import word_spans
@@ -28,11 +28,13 @@ class WordCaption(QLabel):
         self._dim = .55
         self._spans = []
         self._position = None
+        self._interval = None
         self.highlighted_count = 0
         self.word_count = 0
         self.timing_source = "static"
         self._from_count = self._to_count = 0
         self._changed = 0.0
+        self._fade_duration = .12
         self._fade = QTimer(self)
         self._fade.setInterval(30)
         self._fade.timeout.connect(self._animate)
@@ -46,31 +48,71 @@ class WordCaption(QLabel):
         spans, source = word_spans(text, start, end, words) if follow else ([], "static")
         if self.text() == text and self._spans == spans and self.timing_source == source:
             return
+        interval = (float(start), float(end)) if spans else None
+        same_sentence = (self.text() == text and self._interval and interval and
+                         max(self._interval[0], interval[0]) < min(self._interval[1], interval[1]))
+        now = time.monotonic()
+        progress = self._animated_count(now) if same_sentence else 0
+        count = self.highlighted_count if same_sentence else 0
         self.setText(text)
         self._spans, self.timing_source = spans, source
+        self._interval = interval
         self.word_count = len(spans)
         self._layout_key = None
-        self.highlighted_count = self.word_count if source == "static" else 0
-        self._from_count = self._to_count = self.highlighted_count
+        self.highlighted_count = self.word_count if source == "static" else min(count, self.word_count)
+        self._from_count = min(progress, self.highlighted_count)
+        self._to_count = self.highlighted_count
+        self._changed, self._fade_duration = now, .12
         self._fade.stop()
+        if self._from_count < self._to_count:
+            self._fade.start()
+        if not same_sentence:
+            self._position = None
         self.updateGeometry()
         self.update()
 
-    def set_position(self, position):
-        self._position = position
+    def set_position(self, position, *, seek=False):
+        try:
+            position = float(position) if position is not None else None
+            if position is not None and not math.isfinite(position):
+                position = None
+        except (TypeError, ValueError):
+            position = None
+        previous = self._position
+        backward_seek = previous is not None and position is not None and position < previous - .25
+        forward_seek = previous is not None and position is not None and position > previous + 3
         count = self.word_count
         if self._spans:
-            count = sum(position is not None and position >= span["start"] for span in self._spans)
+            count = 0
+            for span in self._spans:
+                if position is None or position < span["start"]:
+                    break
+                count += 1
+            if previous is not None and position is not None and not backward_seek and not seek:
+                count = max(count, self.highlighted_count)
+        self._position = (max(previous, position) if previous is not None and position is not None
+                          and not backward_seek and not seek else position)
         if count != self.highlighted_count:
-            self._from_count, self._to_count = self.highlighted_count, count
+            now = time.monotonic()
+            self._from_count = self._animated_count(now)
+            self._to_count = count
             self.highlighted_count = count
-            self._changed = time.monotonic()
-            self._fade.start()
+            self._changed = now
+            self._fade_duration = min(.5, .12 * max(1, count - self._from_count))
+            if seek or backward_seek or forward_seek or position is None:
+                self._from_count = count
+                self._fade.stop()
+            else:
+                self._fade.start()
             self.update()
+
+    def _animated_count(self, now):
+        amount = min(1, max(0, (now - self._changed) / self._fade_duration))
+        return self._from_count + (self._to_count - self._from_count) * amount
 
     def _animate(self):
         self.update()
-        if time.monotonic() - self._changed >= .12:
+        if time.monotonic() - self._changed >= self._fade_duration:
             self._fade.stop()
 
     def _layout_for(self, width):
@@ -111,31 +153,56 @@ class WordCaption(QLabel):
             self.updateGeometry()
         super().changeEvent(event)
 
-    def _format(self, begin, end, alpha):
-        item = QTextLayout.FormatRange()
-        item.start = len(self.text()[:begin].encode("utf-16-le")) // 2
-        item.length = len(self.text()[begin:end].encode("utf-16-le")) // 2
-        color = QColor(self._color)
-        color.setAlphaF(color.alphaF() * alpha)
-        item.format = QTextCharFormat()
-        item.format.setForeground(color)
-        return item
+    def _text_region(self, layout, origin, begin, end):
+        region = QRegion()
+        begin = len(self.text()[:begin].encode("utf-16-le")) // 2
+        end = len(self.text()[:end].encode("utf-16-le")) // 2
+        for index in range(layout.lineCount()):
+            line = layout.lineAt(index)
+            left = max(begin, line.textStart())
+            right = min(end, line.textStart() + line.textLength())
+            if left >= right:
+                continue
+            # cursorToX already includes the centered line's x position.
+            x1, x2 = line.cursorToX(left)[0], line.cursorToX(right)[0]
+            x = math.floor(min(x1, x2) + origin.x())
+            y = math.floor(line.y() + origin.y())
+            width = math.ceil(max(x1, x2) + origin.x()) - x
+            height = math.ceil(line.y() + line.height() + origin.y()) - y
+            region |= QRegion(QRect(x, y, width, height))
+        return region
 
     def paintEvent(self, event):
         layout, height = self._layout_for(self.contentsRect().width())
-        formats = [] if self._spans else [self._format(0, len(self.text()), 1)]
-        progress = min(1, max(0, (time.monotonic() - self._changed) / .12))
-        for i, span in enumerate(self._spans):
-            old, new = i < self._from_count, i < self._to_count
-            amount = float(old) + (float(new) - float(old)) * progress
-            alpha = self._dim + (1 - self._dim) * amount
-            formats.append(self._format(span["begin"], span["end"], alpha))
+        origin = QPointF(self.contentsRect().left(), max(0, (self.height() - height) / 2))
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
-        base = QColor(self._color)
-        base.setAlphaF(base.alphaF() * (self._dim if self._spans and self.highlighted_count < self.word_count else 1))
-        painter.setPen(base)
-        layout.draw(painter, QPointF(self.contentsRect().left(), max(0, (self.height() - height) / 2)), formats)
+        if not self._spans:
+            painter.setPen(self._color)
+            layout.draw(painter, origin)
+            return
+        progress = max(0, min(self.word_count, self._animated_count(time.monotonic())))
+        completed = math.floor(progress)
+        fraction = progress - completed
+        cutoff = self._spans[completed - 1]["end"] if completed else 0
+        bright = self._text_region(layout, origin, 0, cutoff)
+        current = QRegion()
+        if fraction > 0 and completed < self.word_count:
+            current = self._text_region(layout, origin, cutoff, self._spans[completed]["end"]).subtracted(bright)
+        dark = QRegion(self.rect()).subtracted(bright.united(current))
+        # Qt's multiple foreground selections can skip alternating glyph runs.
+        # Disjoint clips keep one continuous bright prefix, one fading word and
+        # a dark remainder, while reusing the already shaped text layout.
+        for region, alpha in ((dark, self._dim), (bright, 1), (current, self._dim + (1 - self._dim) * fraction)):
+            if region.isEmpty():
+                continue
+            painter.save()
+            painter.setClipRegion(region, Qt.ClipOperation.IntersectClip)
+            color = QColor(self._color)
+            color.setAlphaF(color.alphaF() * alpha)
+            painter.setPen(color)
+            layout.draw(painter, origin)
+            painter.restore()
 
 
 class SubtitleOverlay(QWidget):
@@ -239,9 +306,9 @@ class SubtitleOverlay(QWidget):
         self.update()
         self.setVisible(self._enabled and self._has_caption)
 
-    def set_position(self, position):
+    def set_position(self, position, *, seek=False):
         self._position = position
-        self.english.set_position(position)
+        self.english.set_position(position, seek=seek)
 
     def set_enabled(self, enabled: bool):
         self._enabled = bool(enabled)
