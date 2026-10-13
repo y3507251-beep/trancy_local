@@ -58,6 +58,7 @@ class FakePlayer(QObject):
         self.pauses = self.stops = 0
         self.auto_load = True
         self.remaining = None
+        self.reported_position = None
 
     def prepare(self, path, token):
         self.loads.append((path, token))
@@ -72,6 +73,9 @@ class FakePlayer(QObject):
 
     def remaining_seconds(self):
         return self.remaining
+
+    def position_seconds(self):
+        return self.reported_position
 
     def finish(self, rate, paused):
         self.finishes.append((rate, paused))
@@ -172,7 +176,9 @@ class DubbingSessionTests(unittest.TestCase):
         self.assertEqual(self.session.audio.alignments, [])
         self.bridge.ack(self.bridge.requests[0])
         self.tick()
-        self.assertEqual(self.session.audio.alignments[-1][:3], (1000, 1, False))
+        offset, speed, paused, force = self.session.audio.alignments[-1]
+        self.assertEqual((offset, paused, force), (0, False, True))
+        self.assertLessEqual(4 / speed, 2.8)
 
     def test_pause_buffering_and_seek_start_do_not_play(self):
         self.start()
@@ -305,39 +311,85 @@ class DubbingSessionTests(unittest.TestCase):
 
     def test_rate_and_long_sentence_follow_video_without_backlog(self):
         self.start(duration=8)
+        self.assertEqual(self.session.audio.alignments[-1][0], 0)
+        self.assertGreater(self.session.audio.alignments[-1][1], 1.5)
+        self.assertLessEqual(8 / self.session.audio.alignments[-1][1], 2.8)
         self.tick(rate=2)
-        self.assertEqual(self.session.audio.alignments[-1][1], 3)
-        self.assertEqual(self.session.audio.alignments[-1][0], 1500)
+        self.assertGreater(self.session.audio.alignments[-1][1], 4)
+        self.assertEqual(self.session.audio.alignments[-1][0], 0)
+        self.assertLessEqual(8 / self.session.audio.alignments[-1][1], 1.35)
+        self.assertEqual(self.video["rate"], 2)
         before = len(self.session.audio.alignments)
         self.tick(position=5.1)
         self.assertEqual(len(self.session.audio.alignments), before)
 
     def test_short_speech_keeps_its_natural_speed_and_finishes_without_restarting(self):
         self.start(duration=2)
-        self.assertEqual(self.session.audio.alignments[-1][:3], (1000, 1, False))
+        self.assertEqual(self.session.audio.alignments[-1][:3], (0, 1, False))
         self.now = .4
         self.tick(position=2.4)
-        self.assertAlmostEqual(self.session.audio.alignments[-1][0], 1400)
+        self.assertAlmostEqual(self.session.audio.alignments[-1][0], 400)
         self.assertEqual(self.session.audio.alignments[-1][1], 1)
+        self.play_to(3.9)
+        self.assertEqual(self.session.audio.finishes, [])
         count = len(self.session.audio.alignments)
         pauses = self.session.audio.pauses
-        self.now = 1.1
-        self.tick(position=3.1)
+        self.now = 2.1
+        self.tick(position=4.1)
         self.assertFalse(self.session._ended)
         self.assertEqual(self.session.audio.finishes, [(1, False)])
         self.assertEqual(self.session.audio.pauses, pauses)
         self.assertEqual(len(self.session.audio.alignments), count)
         self.session.audio.ended.emit(dict(token=self.session._media_token))
         self.assertTrue(self.session._ended)
-        self.now = 1.3
-        self.tick(position=3.3)
+        self.now = 2.3
+        self.tick(position=4.3)
         self.assertEqual(len(self.session.audio.alignments), count)
         self.assertEqual(self.session.audio.finishes, [(1, False)])
 
     def test_short_speech_still_follows_the_video_playback_rate(self):
         self.start(duration=2)
         self.tick(rate=2)
-        self.assertEqual(self.session.audio.alignments[-1][:3], (1000, 2, False))
+        self.assertEqual(self.session.audio.alignments[-1][:3], (0, 2, False))
+
+    def test_actual_audio_lag_increases_speed_without_skipping_words(self):
+        self.start(duration=8)
+        initial_speed = self.session.audio.alignments[-1][1]
+        self.session.audio.reported_position = .2
+        self.now = .6
+        self.tick(position=2.6)
+        offset, speed, paused, force = self.session.audio.alignments[-1]
+        self.assertEqual((offset, paused, force), (200, False, False))
+        self.assertGreater(speed, initial_speed)
+        self.assertLessEqual(7.8 / speed, 2.2)
+        self.assertEqual(self.video["rate"], 1)
+
+    def test_pause_and_resume_preserve_the_actual_spoken_position(self):
+        self.start(duration=8)
+        self.session.audio.reported_position = 2
+        self.now = .6
+        self.tick(position=2.6, paused=True)
+        self.assertEqual(self.session.audio.alignments[-1][0], 2000)
+        self.assertTrue(self.session.audio.alignments[-1][2])
+        self.now = 1.2
+        self.tick(position=2.6, paused=True)
+        self.now = 1.3
+        self.tick(position=2.6, paused=False)
+        offset, speed, paused, force = self.session.audio.alignments[-1]
+        self.assertEqual((offset, paused, force), (2000, False, False))
+        self.assertLessEqual(6 / speed, 2.2)
+
+    def test_sentence_window_also_respects_the_actual_video_end(self):
+        self.video["duration"] = 3.5
+        self.start(duration=4)
+        self.assertEqual(self.session.audio.alignments[-1][0], 0)
+        self.assertLessEqual(4 / self.session.audio.alignments[-1][1], 1.35)
+
+    def test_overlapping_subtitle_uses_the_next_sentence_start_as_its_deadline(self):
+        self.session.set_cues(1, [dict(CUE, end=10),
+                                 dict(CUE, start=4, end=7, translation="Next sentence")])
+        self.start(duration=8)
+        self.assertLessEqual(8 / self.session.audio.alignments[-1][1], 1.8)
 
     def test_unavailable_pitch_disables_before_muting_original_video(self):
         notices = []
@@ -376,15 +428,31 @@ class DubbingSessionTests(unittest.TestCase):
         self.assertEqual(len(self.bridge.requests), requests)
         self.assertEqual(len(self.session.audio.alignments), alignments)
 
+    def test_rejected_speed_during_alignment_disables_and_preserves_the_failure_status(self):
+        notices = []
+        self.session.disabled.connect(notices.append)
+        def reject_rate(*_args, **_kwargs):
+            self.session.audio.failed.emit(dict(token=self.session._media_token,
+                code="rate_unavailable", message="无法应用所需语速"))
+        self.session.audio.align = reject_rate
+        self.start(duration=8)
+        self.assertFalse(self.session.enabled)
+        self.assertIsNone(self.session._lease)
+        self.assertFalse(self.bridge.requests[-1]["enabled"])
+        self.assertEqual(notices, ["无法应用所需语速 · 已恢复原声"])
+        self.assertNotIn("英文配音播放中 · 跟随 B 站播放进度", self.messages)
+
     def test_short_tail_in_subtitle_gap_keeps_the_same_clip_without_seek_or_pause(self):
         self.start()
+        speed = self.session.audio.alignments[-1][1]
         media = self.session._media_token
         self.session.audio.remaining = .35
         pauses, stops, loads = self.session.audio.pauses, self.session.audio.stops, len(self.session.audio.loads)
         self.play_to(5.01)
         self.assertEqual(self.session._media_token, media)
         self.assertTrue(self.session._clip_started)
-        self.assertEqual(self.session.audio.finishes, [(1, False)])
+        self.assertAlmostEqual(self.session.audio.finishes[-1][0], speed)
+        self.assertFalse(self.session.audio.finishes[-1][1])
         self.assertEqual(self.session.audio.pauses, pauses)
         self.assertEqual(self.session.audio.stops, stops)
         self.assertEqual(len(self.session.audio.loads), loads)
@@ -392,11 +460,13 @@ class DubbingSessionTests(unittest.TestCase):
 
     def test_natural_video_end_drains_started_tail_despite_html_paused_flag(self):
         self.start()
+        speed = self.session.audio.alignments[-1][1]
         self.session.audio.remaining = .35
         self.play_to(4.8)
         self.now += .2
         self.tick(position=5, paused=True, ended=True, duration=5)
-        self.assertEqual(self.session.audio.finishes[-1], (1, False))
+        self.assertAlmostEqual(self.session.audio.finishes[-1][0], speed)
+        self.assertFalse(self.session.audio.finishes[-1][1])
         self.assertTrue(self.session._clip_started)
         self.assertTrue(self.session._active)
         self.assertIsNotNone(self.session._tail_deadline)
@@ -438,12 +508,14 @@ class DubbingSessionTests(unittest.TestCase):
         self.assertIsNone(self.session._lease)
         self.assertFalse(self.bridge.requests[-1]["enabled"])
 
-    def test_remaining_speech_over_one_second_is_cut_at_the_subtitle_window(self):
+    def test_stalled_player_does_not_admit_over_one_second_tail(self):
         self.start()
         self.session.audio.remaining = 1.01
         stops = self.session.audio.stops
+        self.play_to(4.8)
+        finishes = len(self.session.audio.finishes)
         self.play_to(5.01)
-        self.assertEqual(self.session.audio.finishes, [])
+        self.assertEqual(len(self.session.audio.finishes), finishes)
         self.assertGreater(self.session.audio.stops, stops)
         self.assertIsNone(self.session._clip)
         self.assertIsNone(self.session._tail_deadline)
@@ -451,8 +523,10 @@ class DubbingSessionTests(unittest.TestCase):
     def test_unknown_remaining_duration_does_not_admit_unbounded_tail(self):
         self.start()
         self.session.audio.remaining = None
+        self.play_to(4.8)
+        finishes = len(self.session.audio.finishes)
         self.play_to(5.01)
-        self.assertEqual(self.session.audio.finishes, [])
+        self.assertEqual(len(self.session.audio.finishes), finishes)
         self.assertIsNone(self.session._clip)
 
     def test_tail_deadline_is_not_extended_by_repeated_clock_updates(self):
@@ -476,24 +550,29 @@ class DubbingSessionTests(unittest.TestCase):
 
     def test_user_pause_and_resume_during_tail_preserve_the_one_time_deadline(self):
         self.start()
+        speed = self.session.audio.alignments[-1][1]
         self.session.audio.remaining = .3
         self.play_to(5.01)
         deadline = self.session._tail_deadline
         self.now += .1
         self.tick(position=5.11, paused=True)
-        self.assertEqual(self.session.audio.finishes[-1], (1, True))
+        self.assertAlmostEqual(self.session.audio.finishes[-1][0], speed)
+        self.assertTrue(self.session.audio.finishes[-1][1])
         self.now += .2
         self.tick(position=5.11, paused=False)
-        self.assertEqual(self.session.audio.finishes[-1], (1, False))
+        self.assertAlmostEqual(self.session.audio.finishes[-1][0], speed)
+        self.assertFalse(self.session.audio.finishes[-1][1])
         self.assertEqual(self.session._tail_deadline, deadline)
 
     def test_buffering_at_natural_video_end_keeps_tail_paused(self):
         self.start()
+        speed = self.session.audio.alignments[-1][1]
         self.session.audio.remaining = .3
         self.play_to(4.8)
         self.now += .2
         self.tick(position=5, paused=True, ended=True, duration=5, buffering=True)
-        self.assertEqual(self.session.audio.finishes[-1], (1, True))
+        self.assertAlmostEqual(self.session.audio.finishes[-1][0], speed)
+        self.assertTrue(self.session.audio.finishes[-1][1])
 
     def test_seek_from_tail_replaces_media_and_rejects_its_late_end_signal(self):
         self.start()
@@ -559,15 +638,35 @@ class DubbingSessionTests(unittest.TestCase):
         self.assertEqual(self.session.audio.loads, [])
         self.assertEqual(self.bridge.requests, [])
 
-    def test_missed_short_clip_does_not_start_at_its_predicted_eof(self):
+    def test_late_preparation_starts_the_whole_sentence_and_fits_remaining_time(self):
         self.session.set_enabled(True)
         self.tick(position=3.5)
         self.session.speech.complete(duration=2)
-        self.tick(position=3.5)
-        self.assertTrue(self.session._ended)
-        self.assertFalse(self.session._clip_started)
-        self.assertEqual(self.session.audio.loads, [])
-        self.assertEqual(self.bridge.requests, [])
+        for _ in range(3):
+            self.tick(position=3.5)
+        self.assertFalse(self.session._ended)
+        self.assertTrue(self.session._clip_started)
+        offset, speed, paused, force = self.session.audio.alignments[-1]
+        self.assertEqual((offset, paused, force), (0, False, True))
+        self.assertLessEqual(2 / speed, 1.35)
+        self.assertEqual(len(self.session.audio.loads), 1)
+        self.assertTrue(self.bridge.requests[-1]["enabled"])
+
+    def test_late_mute_ack_does_not_skip_initial_words(self):
+        self.session.set_enabled(True)
+        self.bridge.auto_ack = False
+        self.tick(position=1)
+        self.session.speech.complete(duration=4)
+        self.now = .1
+        self.tick(position=1.1)
+        self.tick(position=1.1)
+        request = self.bridge.requests[-1]
+        self.now = 1.2
+        self.bridge.ack(request)
+        self.tick(position=2.2)
+        offset, speed, paused, force = self.session.audio.alignments[-1]
+        self.assertEqual((offset, paused, force), (0, False, True))
+        self.assertLessEqual(4 / speed, 2.6)
 
     def test_interrupted_overlapping_sentence_cannot_return_after_next_sentence(self):
         self.session.set_cues(1, [dict(CUE, start=0, end=10),

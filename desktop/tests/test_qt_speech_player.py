@@ -312,6 +312,32 @@ class QtSpeechPlayerTests(unittest.TestCase):
         self.media.current_position = 4100
         self.assertEqual(self.audio.remaining_seconds(), 0)
 
+    def test_position_feedback_returns_actual_source_time_without_predicting_ahead(self):
+        self.assertIsNone(self.audio.position_seconds())
+        self.audio._player = self.media
+        self.assertIsNone(self.audio.position_seconds())
+        self.attach()
+        self.media.current_position = 2300
+        self.media.current_rate = 4
+        self.assertEqual(self.audio.position_seconds(), 2.3)
+
+    def test_long_sentence_can_use_rates_above_the_old_four_times_cap(self):
+        self.attach()
+        self.audio.align(0, 6, False, force=True)
+        self.assertEqual(self.media.current_rate, 6)
+        self.assertEqual(self.seeks(), [0])
+        self.assertEqual(self.failed, [])
+
+    def test_backend_rejecting_the_required_speed_fails_without_playing_or_seeking(self):
+        self.attach()
+        def capped_rate(rate):
+            self.media.current_rate = min(rate, 4)
+        self.media.setPlaybackRate = capped_rate
+        self.audio.align(0, 6, False, force=True)
+        self.assertEqual(self.failed[0]["code"], "rate_unavailable")
+        self.assertEqual(self.seeks(), [])
+        self.assertNotIn(("play",), self.media.calls)
+
     def test_unknown_or_unprepared_media_has_no_remaining_time_estimate(self):
         self.assertIsNone(self.audio.remaining_seconds())
         self.audio._player = self.media
