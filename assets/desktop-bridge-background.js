@@ -11,7 +11,7 @@
   const dubbingRequests = new Map();
   const dubbingLeases = new Map();
   const dubbingStatuses = new Set(["active", "restored", "user_override", "expired", "video_changed", "error"]);
-  const dubbingReasons = new Set(["", "disabled", "bridge_disconnected", "lease_expired", "video_changed", "ad_playing", "retired_lease", "replaced", "user_volume", "page_closed", "observer_unavailable"]);
+  const dubbingReasons = new Set(["", "disabled", "bridge_disconnected", "lease_expired", "video_changed", "ad_playing", "retired_lease", "replaced", "user_volume", "user_rate", "rate_unavailable", "page_closed", "observer_unavailable"]);
   const captionErrorCodes = new Set(["bili_metadata_failed", "bili_track_failed", "youtube_metadata_failed", "youtube_track_failed",
     "observer_unavailable", "video_changed", "invalid_caption_payload", "bridge_upload_failed"]);
   const clientId = crypto.randomUUID();
@@ -61,6 +61,7 @@
       seeking: Boolean(raw.seeking), buffering: Boolean(raw.buffering),
       seek_serial: Number.isSafeInteger(raw.seek_serial) && raw.seek_serial >= 0 ? raw.seek_serial : 0,
       dubbing_protocol: raw.dubbing_protocol === 1 ? 1 : 0,
+      rate_control_protocol: raw.rate_control_protocol === 1 ? 1 : 0,
       playback_event: ["play", "pause", "ended", "seeking", "seeked", "waiting", "stalled", "playing", "ratechange", "loadedmetadata", "emptied"].includes(raw.playback_event) ? raw.playback_event : "",
       document_start: Number(raw.document_start) || 0,
       audio_urls: urls.filter(u => typeof u === "string" && u.length <= 16384 && mediaAllowed(u, raw.platform, cid)).slice(0, 12)};
@@ -110,9 +111,12 @@
     if (!job || !/^[a-f0-9]{32}$/.test(job.id || "") || !/^[a-f0-9]{32}$/.test(job.lease_id || "") ||
         typeof job.enabled !== "boolean" || !Number.isSafeInteger(job.tab_id) || job.video?.platform !== "bilibili" ||
         dubbingRequests.has(job.id)) return;
+    const hasRate = Object.hasOwn(job, "playback_rate");
+    if (hasRate && (typeof job.playback_rate !== "number" || !Number.isFinite(job.playback_rate) ||
+        job.playback_rate < .1 || job.playback_rate > 4)) return;
     const entry = videos.get(job.tab_id);
     if (job.enabled && (!entry || entry.video.dubbing_protocol !== 1 || !sameCaptionVideo(entry.video, job.video) ||
-        entry.documentStart !== job.document_start)) {
+        entry.documentStart !== job.document_start || (hasRate && entry.video.rate_control_protocol !== 1))) {
       await post("/v1/dubbing", {id: job.id, tab_id: job.tab_id, video: job.video,
         document_start: job.document_start, lease_id: job.lease_id, status: "error", reason: "video_changed"}).catch(() => {});
       return;
@@ -122,7 +126,7 @@
     try {
       const reply = await chrome.tabs.sendMessage(job.tab_id, {to: [], kind: "trancy-desktop-dubbing-request-v1",
         request_id: job.id, lease_id: job.lease_id, document_start: job.document_start, video: job.video,
-        enabled: job.enabled}, {frameId: 0});
+        enabled: job.enabled, ...(hasRate && job.enabled ? {playback_rate: job.playback_rate} : {})}, {frameId: 0});
       if (!reply?.accepted) throw new Error("dubbing observer unavailable");
     } catch (_) {
       dubbingRequests.delete(job.id);
@@ -150,6 +154,8 @@
       reason: dubbingReasons.has(message.reason) ? message.reason : "",
       position: Math.max(0, Math.min(604800, Number(message.position) || 0)), paused: Boolean(message.paused),
       ended: message.ended === true,
+      original_rate: typeof message.original_rate === "number" && Number.isFinite(message.original_rate) &&
+        message.original_rate > 0 && message.original_rate <= 16 ? message.original_rate : null,
       rate: Math.max(.1, Math.min(16, Number(message.rate) || 1)), seeking: Boolean(message.seeking),
       buffering: Boolean(message.buffering),
       seek_serial: Number.isSafeInteger(message.seek_serial) && message.seek_serial >= 0 ? message.seek_serial : 0}).catch(() => {});

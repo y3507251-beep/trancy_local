@@ -30,7 +30,7 @@ CAPTION_ERROR_CODES = frozenset({
 DUBBING_STATUSES = frozenset({"active", "restored", "user_override", "expired", "video_changed", "error"})
 DUBBING_REASONS = frozenset({"", "disabled", "bridge_disconnected", "lease_expired", "video_changed",
                            "ad_playing", "retired_lease", "replaced", "user_volume", "page_closed",
-                           "observer_unavailable", "request_timeout"})
+                           "observer_unavailable", "request_timeout", "user_rate", "rate_unavailable"})
 PLAYBACK_EVENTS = frozenset({"play", "pause", "ended", "seeking", "seeked", "waiting", "stalled",
                            "playing", "ratechange", "loadedmetadata", "emptied"})
 
@@ -112,6 +112,7 @@ def normalize_video(raw: dict) -> dict:
              "seeking": bool(raw.get("seeking", False)), "buffering": bool(raw.get("buffering", False)),
              "seek_serial": int(finite("seek_serial", 0, 0, 2147483647)),
              "dubbing_protocol": 1 if type(raw.get("dubbing_protocol")) is int and raw["dubbing_protocol"] == 1 else 0,
+             "rate_control_protocol": 1 if type(raw.get("rate_control_protocol")) is int and raw["rate_control_protocol"] == 1 else 0,
              "playback_event": raw.get("playback_event") if isinstance(raw.get("playback_event"), str) and raw["playback_event"] in PLAYBACK_EVENTS else "",
              "document_start": finite("document_start", 0, 0, 1e16),
              "audio_urls": audio}
@@ -335,9 +336,12 @@ class BrowserBridge(QObject):
                 for job_id, job in self._dubbing_jobs.items():
                     if job["client"] == client_id and not job["sent"] and job["deadline"] > now:
                         job["sent"] = True
-                        dubbing.append({"id": job_id, "tab_id": job["video"]["tab_id"], "video": job["video"],
-                                        "document_start": job["video"]["document_start"],
-                                        "lease_id": job["lease_id"], "enabled": job["enabled"]})
+                        command = {"id": job_id, "tab_id": job["video"]["tab_id"], "video": job["video"],
+                                   "document_start": job["video"]["document_start"],
+                                   "lease_id": job["lease_id"], "enabled": job["enabled"]}
+                        if job.get("playback_rate") is not None:
+                            command["playback_rate"] = job["playback_rate"]
+                        dubbing.append(command)
                         if len(dubbing) == 4:
                             break
                 return 200, {"jobs": pending, "caption_jobs": captions, "dubbing_jobs": dubbing}
@@ -405,7 +409,7 @@ class BrowserBridge(QObject):
         videos = self.videos()
         return videos[0] if videos else None
 
-    def set_dubbing(self, video: dict, enabled: bool, lease_id: str) -> str:
+    def set_dubbing(self, video: dict, enabled: bool, lease_id: str, *, playback_rate=None) -> str:
         """Temporarily mute one exact Bilibili video, without blocking Qt.
 
         Renew an enabled lease every second, using the same 32-hex lease ID.
@@ -413,9 +417,14 @@ class BrowserBridge(QObject):
         Disable restores the previous mute state; page expiry after 3 seconds
         covers failed requests, disconnected bridges and crashed applications.
         Caller supplies local audio playback; this API never plays or seeks media.
+        An optional 0.1--4 playback rate temporarily owns the page's rate too;
+        omitting it preserves the basic dubbing mode's ordinary video speed.
         """
         if type(enabled) is not bool or not isinstance(lease_id, str) or not re.fullmatch(r"[a-f0-9]{32}", lease_id):
             raise ValueError("无效的英文配音租约")
+        if playback_rate is not None and (type(playback_rate) not in (int, float) or
+                not .1 <= playback_rate <= 4 or not math.isfinite(playback_rate)):
+            raise ValueError("视频配音倍率必须是 0.1 至 4 之间的有限数字")
         clean = normalize_video(video)
         if clean["platform"] != "bilibili" or not clean["cid"]:
             raise ValueError("英文配音第一期只支持已识别 CID 的 B 站视频")
@@ -437,6 +446,8 @@ class BrowserBridge(QObject):
                     raise ValueError("网页视频已切换或浏览器连接已断开")
                 if current.get("dubbing_protocol") != 1:
                     raise ValueError("请重新加载 0.1.4 及以上的桌面字幕连接器并刷新 B 站网页，再开启英文配音")
+                if playback_rate is not None and current.get("rate_control_protocol") != 1:
+                    raise ValueError("视频配音调速需要重新加载 0.1.6 及以上的连接器并刷新 B 站网页")
                 if current.get("ad_playing") or current.get("is_live"):
                     raise ValueError("广告或直播期间暂不接管原视频声音")
                 for other_id, other in list(self._dubbing_leases.items()):
@@ -453,9 +464,9 @@ class BrowserBridge(QObject):
                                                        "tab_id", "source_id", "bridge_key", "document_start")}
                 if not self._server or identity is None:
                     raise ValueError("浏览器连接已断开；网页将在租约到期后恢复原声")
-            return self._queue_dubbing(identity, enabled, lease_id)
+            return self._queue_dubbing(identity, enabled, lease_id, playback_rate=playback_rate)
 
-    def _queue_dubbing(self, identity: dict, enabled: bool, lease_id: str) -> str:
+    def _queue_dubbing(self, identity: dict, enabled: bool, lease_id: str, *, playback_rate=None) -> str:
         # A newer command supersedes older acknowledgements for this lease.
         for old_id, old in list(self._dubbing_jobs.items()):
             if old["lease_id"] == lease_id:
@@ -466,6 +477,7 @@ class BrowserBridge(QObject):
         timer.daemon = True
         self._dubbing_jobs[request_id] = {"client": identity["source_id"], "video": dict(identity),
             "lease_id": lease_id, "enabled": enabled, "sent": False, "timer": timer,
+            "playback_rate": float(playback_rate) if enabled and playback_rate is not None else None,
             "deadline": time.monotonic() + 2.5}
         previous = self._dubbing_leases.get(lease_id)
         request_ids = ((previous or {}).get("request_ids", []) + [request_id])[-16:]
@@ -535,6 +547,9 @@ class BrowserBridge(QObject):
             event.update(paused=bool(body.get("paused", True)), ended=body.get("ended") is True,
                          seeking=bool(body.get("seeking", False)),
                          buffering=bool(body.get("buffering", False)))
+            original_rate = body.get("original_rate")
+            event["original_rate"] = (float(original_rate) if type(original_rate) in (int, float)
+                and 0 < original_rate <= 16 and math.isfinite(original_rate) else None)
             serial = body.get("seek_serial", 0)
             event["seek_serial"] = min(2147483647, serial) if type(serial) is int and serial >= 0 else 0
             if status != "active":

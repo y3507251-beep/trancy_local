@@ -2,8 +2,8 @@
   "manifest_version": 3,
   "name": "Trancy 桌面字幕连接器",
   "description": "将 B 站和 YouTube 的视频信息、播放进度及字幕翻译连接到 Trancy 桌面应用。",
-  "version": "0.1.5",
-  "version_name": "桌面连接版 0.1.5",
+  "version": "0.1.6",
+  "version_name": "桌面连接版 0.1.6",
   "default_locale": "en",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAyBs3G5Xzn5xUjBHxmIWI8iYX/36rDek05RR/POQ2/K2EUkfEh/8HsTnr8ys+pV6wr4xfSQdUfFGDkzHtzdDEDDsm+K3Dx5yhtHNxD08fpUlmu5YxVIT7LZOIeUZHWFOwoPKp+YU7iVcDT2CTj/3bkTLrUoN9sKEdWBRUzHCBJyCkKDn17Ngzh3yW3aPtTBtboHP3p1YKk5yG8hXHZ1WsBnLlRMeF7VwhIEfJlAoTChE9GFJle9rd6yLZERr4nikYS9Lv1zK4HvrYMA/0//l5G16waTN5Ap28TiKz6u2ACG5rnpVJ6m4JJcBuu94RBCwwz9oRGYB7Jl7w34GqgPz/SQIDAQAB",
   "action": {

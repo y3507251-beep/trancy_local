@@ -69,7 +69,7 @@ class MainWindow(QMainWindow):
         icon = ROOT.parent / "assets/icons/ic128.png"
         if icon.exists():
             self.setWindowIcon(QIcon(str(icon)))
-        self.resize(1040, 810)
+        self.resize(1080, 900)
         self.setMinimumSize(920, 720)
         self.setStyleSheet(STYLE)
         self.timeline = Timeline()
@@ -104,9 +104,18 @@ class MainWindow(QMainWindow):
         self._last_video = None
         self._last_web_seek_serial = None
         self._dubbing = None
+        self._prepared_dubbing = None
+        self._redub_preparation = None
+        self._redub_preparations = set()
+        self._redub_cancelled = set()
+        self._redub_start_context = None
+        self._redub_manifest = None
+        self._redub_previous_blocked = False
+        self._bridge_closed = False
         self._bound_tab = None
         self._closing = False
         self._backend_closed = False
+        self._retiring_asr = set()
         self._close_started = 0.0
         self._temp_recycling = 0
         self._last_error = ""
@@ -114,10 +123,7 @@ class MainWindow(QMainWindow):
         self.overlay = SubtitleOverlay(self.settings)
         self.overlay.moved.connect(lambda x, y: self.settings.update(overlay_x=x, overlay_y=y))
         self.overlay.set_locked(bool(self.settings.get("overlay_locked")))
-        self.asr = ASRSession(self)
-        self.asr.updated.connect(self._asr_event)
-        self.asr.idle.connect(self._schedule)
-        self.asr.closed.connect(self._asr_closed)
+        self.asr = self._create_asr_session()
         self.bridge = BrowserBridge(self)
         self.bridge.video_changed.connect(self._browser_update)
         self.bridge.captions_ready.connect(self._browser_captions)
@@ -154,6 +160,15 @@ class MainWindow(QMainWindow):
             result.setObjectName("primary")
         result.clicked.connect(callback)
         return result
+
+    def _create_asr_session(self):
+        # ASRSession starts its process only on submit(). Keep a fresh idle
+        # coordinator for ordinary subtitles after retiring a resident model.
+        asr = ASRSession(self)
+        asr.updated.connect(self._asr_event)
+        asr.idle.connect(self._schedule)
+        asr.closed.connect(lambda owner=asr: self._asr_closed(owner))
+        return asr
 
     def _build_ui(self):
         central = QWidget()
@@ -249,6 +264,16 @@ class MainWindow(QMainWindow):
         web_layout.addWidget(self.english_dubbing)
         web_layout.addWidget(self.dubbing_status)
         self.english_dubbing.toggled.connect(self._dubbing_toggled)
+        self.prepared_dubbing = QCheckBox("保留背景音＋原人物音色英文配音（单人）")
+        self.prepared_dubbing.setChecked(False)
+        self.prepared_dubbing.setToolTip("整段准备后播放；长英文段自动放慢视频，最低 0.75 倍")
+        self.redub_prepare_button = self._button("准备整段原音色配音", self._prepare_redub)
+        self.redub_status = QLabel("新模式默认关闭 · 先生成双语字幕，再准备整段配音")
+        self.redub_status.setWordWrap(True)
+        web_layout.addWidget(self.prepared_dubbing)
+        web_layout.addWidget(self.redub_prepare_button)
+        web_layout.addWidget(self.redub_status)
+        self.prepared_dubbing.toggled.connect(self._prepared_dubbing_toggled)
 
         controls = QHBoxLayout()
         controls.addWidget(self._button("停止当前任务", self.stop))
@@ -331,6 +356,8 @@ class MainWindow(QMainWindow):
             self.status.setText(str(text))
 
     def _dubbing_toggled(self, enabled):
+        if enabled and self.prepared_dubbing.isChecked():
+            self.prepared_dubbing.setChecked(False)
         if enabled and self._dubbing is None:
             try:
                 from .dubbing import DubbingSession
@@ -354,16 +381,179 @@ class MainWindow(QMainWindow):
         self.dubbing_status.setText(message)
 
     def _refresh_dubbing(self):
-        if self._dubbing is None or self._closing:
+        if self._closing:
             return
         video = (self._last_video if self.mode == "browser" and self._last_video
                  and browser_identity(self._last_video) == self.identity else None)
-        self._dubbing.set_source(self.generation, video)
-        self._dubbing.set_cues(self.generation, self.timeline.cues)
+        if self._dubbing is not None:
+            self._dubbing.set_source(self.generation, video)
+            self._dubbing.set_cues(self.generation, self.timeline.cues)
+        if self._prepared_dubbing is not None:
+            self._prepared_dubbing.set_source(self.generation, video)
+
+    def _prepared_dubbing_toggled(self, enabled):
+        if not enabled:
+            if self._prepared_dubbing:
+                self._prepared_dubbing.set_enabled(False)
+            self._cancel_redub_preparation()
+            self.redub_status.setText("原音色配音已关闭 · 播放原声")
+            return
+        if self.english_dubbing.isChecked():
+            self.english_dubbing.setChecked(False)
+        if self._redub_manifest is None:
+            if self._redub_preparation is None:
+                self._prepare_redub()
+            return
+        try:
+            if self._prepared_dubbing is None:
+                from .prepared_dubbing import PreparedDubbingSession
+                self._prepared_dubbing = PreparedDubbingSession(self.bridge, self)
+                self._prepared_dubbing.status.connect(self.redub_status.setText)
+                self._prepared_dubbing.disabled.connect(self._prepared_dubbing_disabled)
+                self._prepared_dubbing.closed.connect(self._dubbing_closed)
+            self._refresh_dubbing()
+            self._prepared_dubbing.set_manifest(self._redub_manifest)
+            self._prepared_dubbing.set_enabled(True)
+        except Exception as error:
+            self._prepared_dubbing_disabled("原音色配音未能启用：" + str(error))
+
+    def _prepared_dubbing_disabled(self, message):
+        self.prepared_dubbing.setChecked(False)
+        self.redub_status.setText(message)
+
+    def _prepare_redub(self):
+        if self._redub_preparation is not None:
+            self._cancel_redub_preparation()
+            self.redub_status.setText("正在取消整段配音准备，已生成的文件会保留")
+            return
+        video = self._last_video
+        if (self.mode != "browser" or not video or video.get("platform") != "bilibili"
+                or browser_identity(video) != self.identity):
+            self._prepared_dubbing_disabled("请先选择 B 站单人视频并点击“生成所选网页视频双语字幕”")
+            return
+        if video.get("rate_control_protocol") != 1:
+            self._prepared_dubbing_disabled("请重新加载 0.1.6 桌面字幕连接器并刷新 B 站页面")
+            return
+        if self._caption_context and (not self._caption_context.get("finished") or self._caption_context.get("failed")):
+            self._prepared_dubbing_disabled("请等待原字幕读取完成；读取失败时先点击“重试未完成字幕”")
+            return
+        if self._prepared_dubbing:
+            self._prepared_dubbing.stop()
+        from .redub_preparation import RedubPreparation
+        preparation = RedubPreparation(self.bridge, self)
+        preparation._window_generation = self.generation
+        self._redub_preparation = preparation
+        self._redub_preparations.add(preparation)
+        self._redub_previous_blocked = self._recognition_blocked
+        self._recognition_blocked = True
+        # The complete preparation job owns recognition. Cancelled requests
+        # alone leave the ordinary ASR model resident, so its process must exit
+        # before this job can load separation, recognition or voice models.
+        if self._active:
+            self._active["redub_superseded"] = True
+        if self._pending_file and self._pending_file.get("window"):
+            self._pending_file = None
+        preparation.progress.connect(lambda text, p=preparation: self._redub_progress(p, text))
+        preparation.captions_ready.connect(lambda event, p=preparation: self._redub_captions(event, p))
+        preparation.ready.connect(lambda event, p=preparation: self._redub_ready(p, event))
+        preparation.failed.connect(lambda message, p=preparation: self._redub_failed(p, message))
+        preparation.closed.connect(lambda p=preparation: self._redub_preparation_closed(p))
+        self.redub_prepare_button.setText("取消整段配音准备")
+        self.redub_status.setText("正在释放之前的识别模型 · 原视频可正常播放")
+        self.model_info.setText("正在释放之前的识别模型")
+        self._redub_start_context = dict(preparation=preparation, generation=self.generation,
+            video=dict(video), cues=list(self.timeline.cues), complete=self._source_complete,
+            mode=self.engine.currentData(), options=self._source_options(), force=self._redub_manifest is not None)
+        old_asr = self.asr
+        self._retiring_asr.add(old_asr)
+        self.asr = self._create_asr_session()
+        self._backend_closed = False
+        old_asr.shutdown()
+
+    def _start_redub_after_asr_exit(self):
+        context = self._redub_start_context
+        if context is None or self._retiring_asr:
+            return
+        self._redub_start_context = None
+        preparation = context.pop("preparation")
+        if (self._closing or preparation is not self._redub_preparation
+                or preparation in self._redub_cancelled or context["generation"] != self.generation
+                or self.mode != "browser" or browser_identity(context["video"]) != self.identity):
+            preparation.shutdown()
+            return
+        self.redub_status.setText("正在准备整段配音 · 准备期间原视频可正常播放")
+        self.model_info.setText("原识别模型已释放 · 准备整段配音")
+        try:
+            preparation.start(**context)
+        except Exception as error:
+            self._redub_failed(preparation, str(error))
+
+    def _redub_progress(self, preparation, text):
+        if (preparation is self._redub_preparation and preparation not in self._redub_cancelled
+                and not self._closing):
+            self.redub_status.setText(text)
+
+    def _redub_captions(self, event, preparation=None):
+        if (self._closing or event.get("generation") != self.generation
+                or (preparation is not None and (preparation is not self._redub_preparation
+                    or preparation in self._redub_cancelled))):
+            return
+        self.timeline.clear()
+        self.timeline.add(event["cues"])
+        self._source_complete = True
+        self._recognition_blocked = True
+        self._cache_pending = True
+        self._translation_dirty = True
+        self.model_info.setText("整段字幕已准备 · 播放期间无需识别")
+        self._displayed_key = None
+        self._refresh_dubbing()
+        self._render_history()
+
+    def _redub_ready(self, preparation, event):
+        if (preparation is not self._redub_preparation or self._closing
+                or preparation in self._redub_cancelled
+                or event.get("generation") != self.generation or event.get("identity") != self.identity):
+            return
+        self._redub_manifest = event["manifest"]
+        self.redub_status.setText("整段配音已准备好 · 长句视频最低 0.75 倍 · 可开启上方新模式")
+        self.redub_prepare_button.setText("重新准备整段原音色配音")
+        preparation.shutdown()
+        if self.prepared_dubbing.isChecked():
+            self._prepared_dubbing_toggled(True)
+
+    def _redub_failed(self, preparation, message):
+        if preparation is not self._redub_preparation or preparation in self._redub_cancelled:
+            return
+        self._redub_cancelled.add(preparation)
+        self._prepared_dubbing_disabled(message)
+        self._cancel_redub_preparation()
+
+    def _cancel_redub_preparation(self):
+        if self._redub_preparation is not None:
+            if (self._redub_start_context is not None and
+                    self._redub_start_context["preparation"] is self._redub_preparation):
+                self._redub_start_context = None
+            self._redub_cancelled.add(self._redub_preparation)
+            self._redub_preparation.shutdown()
+
+    def _redub_preparation_closed(self, preparation):
+        self._redub_preparations.discard(preparation)
+        self._redub_cancelled.discard(preparation)
+        if preparation is self._redub_preparation:
+            self._redub_preparation = None
+            if getattr(preparation, "_window_generation", None) == self.generation:
+                self._recognition_blocked = self._source_complete or self._redub_previous_blocked
+            self.redub_prepare_button.setText("重新准备整段原音色配音" if self._redub_manifest else "准备整段原音色配音")
+        preparation.deleteLater()
+        self._dubbing_closed()
 
     def _dubbing_closed(self):
-        if self._closing:
+        if (self._closing and not self._bridge_closed
+                and (self._dubbing is None or self._dubbing.is_closed)
+                and (self._prepared_dubbing is None or self._prepared_dubbing.is_closed)
+                and not self._redub_preparations and not self._retiring_asr):
             self.bridge.stop()
+            self._bridge_closed = True
             if self._can_close():
                 self._finish_close()
 
@@ -513,6 +703,9 @@ class MainWindow(QMainWindow):
         if self._dubbing is not None:
             position, paused, rate = self._playback_clock()
             self._dubbing.tick(self._last_video if self.mode == "browser" else None, position, paused, rate)
+        if self._prepared_dubbing is not None:
+            position, paused, rate = self._playback_clock()
+            self._prepared_dubbing.tick(self._last_video if self.mode == "browser" else None, position, paused, rate)
 
     @staticmethod
     def _browser_tab(video):
@@ -794,7 +987,8 @@ class MainWindow(QMainWindow):
     def _drive_buffer(self, position=None, paused=None):
         if (self._closing or self.mode not in ("potplayer", "browser") or self._media_source is None
                 or self._media_source["generation"] != self.generation or self._source_complete
-                or self._active is not None or self._pending_file is not None or self._recognition_blocked):
+                or self._active is not None or self._pending_file is not None or self._recognition_blocked
+                or self._redub_preparations or self._retiring_asr):
             return
         if position is None:
             position, paused, _ = self._playback_clock()
@@ -829,7 +1023,9 @@ class MainWindow(QMainWindow):
         self.translator.set_position(self.generation, position, seek=seek)
         if seek:
             self._buffer.seek()
-            self._recognition_blocked = False
+            # Seeking can retry ordinary ASR errors, but the full-video job
+            # owns recognition until all of its cancellation/close work ends.
+            self._recognition_blocked = bool(self._redub_preparations)
             if self._pending_file and self._pending_file.get("window"):
                 self._pending_file = None
             task = self._active
@@ -838,7 +1034,7 @@ class MainWindow(QMainWindow):
         self._drive_buffer(position, paused)
 
     def _schedule(self):
-        if self._closing or self._active is not None:
+        if self._closing or self._active is not None or self._redub_preparations or self._retiring_asr:
             return
         item = self._pending_file
         if item is not None:
@@ -883,7 +1079,7 @@ class MainWindow(QMainWindow):
         task = self._active
         if task is None or event.get("job_id") != task["job_id"]:
             return
-        current = (task["generation"] == self.generation and not self._closing
+        current = (task["generation"] == self.generation and not self._closing and not task.get("redub_superseded")
                    and not (task.get("window") and self._source_kind == "native"))
         if current and kind == "model":
             self.model_info.setText(f"{event.get('model', self.model.currentText())} · {event.get('device', self.device.currentText())}")
@@ -1019,6 +1215,8 @@ class MainWindow(QMainWindow):
                 cue = self.timeline.at(position)
         if self._dubbing is not None:
             self._dubbing.tick(self._last_video if self.mode == "browser" else None, position, paused, rate)
+        if self._prepared_dubbing is not None:
+            self._prepared_dubbing.tick(self._last_video if self.mode == "browser" else None, position, paused, rate)
         key = (cue_key(cue), cue.get("translation", ""),
                tuple((w.get("text"), w.get("start"), w.get("end")) for w in (cue.get("words") or []))) if cue else None
         if key != self._displayed_key:
@@ -1035,6 +1233,14 @@ class MainWindow(QMainWindow):
     def stop(self):
         if self._dubbing is not None:
             self._dubbing.stop()
+        if self._prepared_dubbing is not None:
+            self._prepared_dubbing.stop()
+        self.prepared_dubbing.blockSignals(True)
+        self.prepared_dubbing.setChecked(False)
+        self.prepared_dubbing.blockSignals(False)
+        self._redub_manifest = None
+        if self._redub_preparation is not None:
+            self._cancel_redub_preparation()
         self._save_cache(force=True)
         self.generation += 1
         if hasattr(self, "translator"):
@@ -1112,11 +1318,27 @@ class MainWindow(QMainWindow):
             value = 0
         return f"{value // 3600:02d}:{value // 60 % 60:02d}:{value % 60:02d}" if value >= 3600 else f"{value // 60:02d}:{value % 60:02d}"
 
-    def _asr_closed(self):
-        self._backend_closed = True
-        if self._closing and self._active:
+    def _asr_closed(self, asr=None):
+        asr = self.asr if asr is None else asr
+        retiring = asr in self._retiring_asr
+        if retiring:
+            self._retiring_asr.discard(asr)
+            asr.deleteLater()
+        elif asr is not self.asr:
+            return
+        else:
+            self._backend_closed = True
+        # Closing the fresh, empty coordinator is not proof that a retired
+        # model has released the old task's input. Wait for those owners too.
+        if self._active and ((retiring and not self._retiring_asr and self._active.get("redub_superseded"))
+                or (self._closing and not self._active.get("redub_superseded"))):
             task, self._active = self._active, None
             self._release_task_source(task)
+        if not self._closing:
+            self._start_redub_after_asr_exit()
+            self._schedule()
+            self._drive_buffer()
+        self._dubbing_closed()
 
     def _release_task_source(self, task):
         if task.get("temporary") or task.get("recycle_source"):
@@ -1131,6 +1353,8 @@ class MainWindow(QMainWindow):
                 and not self.downloader.running
                 and self._download_context is None and not self._native_readers
                 and (self._dubbing is None or self._dubbing.is_closed)
+                and (self._prepared_dubbing is None or self._prepared_dubbing.is_closed)
+                and not self._redub_preparations and not self._retiring_asr
                 and self.translator.is_closed)
 
     def closeEvent(self, event):
@@ -1148,10 +1372,11 @@ class MainWindow(QMainWindow):
         self.overlay.hide()
         self.pot.stop()
         self.translator.shutdown()
-        if self._dubbing is None:
-            self.bridge.stop()
-        else:
+        if self._dubbing is not None:
             self._dubbing.shutdown()
+        if self._prepared_dubbing is not None:
+            self._prepared_dubbing.shutdown()
+        self._dubbing_closed()
         self.asr.shutdown()
 
     def _finish_close(self):
