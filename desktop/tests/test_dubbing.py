@@ -297,6 +297,63 @@ class DubbingSessionTests(unittest.TestCase):
         self.tick(position=5.1)
         self.assertEqual(len(self.session.audio.alignments), before)
 
+    def test_short_speech_keeps_its_natural_speed_and_finishes_without_restarting(self):
+        self.start(duration=2)
+        self.assertEqual(self.session.audio.alignments[-1][:3], (1000, 1, False))
+        self.now = .4
+        self.tick(position=2.4)
+        self.assertAlmostEqual(self.session.audio.alignments[-1][0], 1400)
+        self.assertEqual(self.session.audio.alignments[-1][1], 1)
+        count = len(self.session.audio.alignments)
+        self.now = 1.1
+        self.tick(position=3.1)
+        self.assertTrue(self.session._ended)
+        self.now = 1.3
+        self.tick(position=3.3)
+        self.assertEqual(len(self.session.audio.alignments), count)
+
+    def test_short_speech_still_follows_the_video_playback_rate(self):
+        self.start(duration=2)
+        self.tick(rate=2)
+        self.assertEqual(self.session.audio.alignments[-1][:3], (1000, 2, False))
+
+    def test_unavailable_pitch_disables_before_muting_original_video(self):
+        notices = []
+        self.session.disabled.connect(notices.append)
+        self.session.audio.auto_load = False
+
+        def cannot_prepare(path, token):
+            self.session.audio.loads.append((path, token))
+            self.session.audio.failed.emit(dict(token=token, code="pitch_unavailable",
+                                                message="保留音高不可用"))
+
+        self.session.audio.prepare = cannot_prepare
+        self.session.set_enabled(True)
+        self.tick()
+        self.session.speech.complete()
+        self.tick()
+        self.assertFalse(self.session.enabled)
+        self.assertEqual(self.bridge.requests, [])
+        self.assertEqual(self.session.audio.alignments, [])
+        self.assertIsNone(self.session._lease)
+        self.assertEqual(notices, ["保留音高不可用 · 已恢复原声"])
+        self.tick()
+        self.assertEqual(self.bridge.requests, [])
+
+    def test_pitch_failure_after_playing_restores_original_and_stays_disabled(self):
+        self.start()
+        lease = self.session._lease
+        self.session.audio.failed.emit(dict(token=self.session._media_token,
+                                            code="pitch_unavailable", message="保留音高不可用"))
+        self.assertFalse(self.session.enabled)
+        self.assertIsNone(self.session._lease)
+        self.assertEqual(self.bridge.requests[-1]["lease_id"], lease)
+        self.assertFalse(self.bridge.requests[-1]["enabled"])
+        requests, alignments = len(self.bridge.requests), len(self.session.audio.alignments)
+        self.tick()
+        self.assertEqual(len(self.bridge.requests), requests)
+        self.assertEqual(len(self.session.audio.alignments), alignments)
+
     def test_interrupted_overlapping_sentence_cannot_return_after_next_sentence(self):
         self.session.set_cues(1, [dict(CUE, start=0, end=10),
                                  dict(CUE, start=5, end=6, translation="Short next sentence")])

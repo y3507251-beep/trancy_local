@@ -18,7 +18,7 @@ Windows / PyQt6 桌面应用：设置窗口与可在整个桌面自由拖动的�
 - 查看启动错误：双击 [启动桌面字幕.cmd](启动桌面字幕.cmd)。
 - 启动诊断日志：`desktop/data/logs/desktop.log`。
 
-启动器优先使用 `desktop/.venv/Scripts/` 下的独立解释器；没有该环境时，使用当前电脑已有的 `D:\ProjectsPycharm\MultiProjects\.venv\Scripts\pythonw.exe`／`python.exe`。
+启动器优先使用 `desktop/.venv/Scripts/` 下的独立解释器；其次使用当前电脑的 `D:\dev\TrancyDesktop\.venv\Scripts/`。本机已为英文配音建立这个独立环境，使用 Qt 6.11.2，避免继续调用旧 Qt 6.8 播放器。两者都不存在时才回退到原有的 `D:\ProjectsPycharm\MultiProjects\.venv\Scripts/`；旧环境可以显示字幕，但不再使用会改变音高的配音变速。
 
 在新电脑安装桌面界面依赖，可在 `desktop` 目录执行：
 
@@ -28,7 +28,7 @@ py -3.13 -m venv .venv
 .\.venv\Scripts\python.exe -B app.py
 ```
 
-[requirements.txt](requirements.txt) 包含 PyQt6、Requests 和 Send2Trash。界面环境不需要再安装一份 Whisper、PyTorch 或 yt-dlp；识别和网页音频处理使用下面的共享环境。
+[requirements.txt](requirements.txt) 包含 PyQt6 6.10 或更新版本、Requests 和 Send2Trash。界面环境不需要再安装一份 Whisper、PyTorch 或 yt-dlp；识别和网页音频处理使用下面的共享环境。
 
 默认 SubtitleService 目录为 `D:\dev\SubtitleService`。可以在设置窗口右侧选择实际引擎目录。需要已有：
 
@@ -79,6 +79,10 @@ py -3.13 -m venv .venv
 语音准备在后台的单个可复用进程中执行。先准备当前句，再准备随后最多 5 句；跳转取消旧位置待处理内容。`desktop/data/dubbing-cache/` 按文本、音色、引擎版本和合成语速缓存，重复观看可复用；与字幕缓存分开，不自动删除损坏或未完成文件。
 
 播放同步使用 [Qt 音频播放器](https://doc.qt.io/qt-6/qmediaplayer.html)：暂停、缓冲、跳转开始时暂停配音，跳转结束后按新位置定位；短距离跳转也由网页事件标识处理。过期的字幕、静音确认和播放器事件不会继续播放旧句。倍速跟随原视频；句子时间窗口截止或下一句到达时结束当前配音。较长句子最多额外加速 **1.5 倍**，仍读不完时在该窗口截止处结束，不积压到后面的句子。第一期保持原视频播放节奏。
+
+变速明确开启 [Qt 6.10 新增的音高补偿](https://doc.qt.io/qt-6/qmediaplayer.html#pitchCompensation-prop)，加快／放慢时保持原有音高。短句按自然语速读完，不再为了占满字幕窗口强制降到 0.85 倍。新句首次定位，真实跳转立即定位；普通时钟误差只有持续明显偏离时才纠正，避免抖动导致反复拖动音频。播放器不支持音高补偿时会停用配音、显示更新环境的原因并恢复原声。
+
+音高补偿解决变速引起的变调，英文词多的长句仍可能读得较快；超过窗口的内容仍按上述截止策略处理。此修复没有更换 Windows 音色，也没有自动暂停／放慢原视频。
 
 关闭开关、停止任务、换视频、刷新或退出后，恢复接管前的静音状态和原声；原本静音的视频仍保持静音。用户主动改变音量／静音设置会解除配音接管并保留新设置。桌面每约 0.8 秒续租，缺少播放状态或确认超过约 2 秒先停配音；网页超过 **3 秒**未收到有效续租会自行恢复原声。关闭桌面时先等待恢复确认或短暂宽限，再关闭桥接服务。
 
@@ -173,7 +177,7 @@ Google 模式是桌面的默认选项。插件模式跟随连接器扩展当前�
 
 2026-10-13 的本轮验证包括原字幕优先、3／30／90 预译、跳转／页面代次隔离、部分缓存、暂停与广告期间不识别、词时间轴、关闭时等待任务与回收站清理。
 
-当前 **245 项自动化检查全部通过**，包括英文逐词点亮的实际像素顺序、淡入词、播放时钟抖动和词轴更新回归；三个浏览器桥 JavaScript 文件通过语法检查。点亮修复的画面与逐词亮度记录在 `desktop/data/validation/word-follow-order/`。
+当前 **264 项自动化检查全部通过**，包括英文逐词点亮的实际像素顺序、淡入词、播放时钟抖动和词轴更新回归；三个浏览器桥 JavaScript 文件通过语法检查。点亮修复的画面与逐词亮度记录在 `desktop/data/validation/word-follow-order/`。
 
 完整 MainWindow 链路使用真实 SRT 读取器、受控播放位置和受控译文验证：100 条原字幕只预译当前窗口的 90 条，批次为 3／30／30／27；没有启动 ASR 进程，重启后复用已有译文。新版 Google HTTP 连接实现也实测通过了各 3 句的英文→中文与中文→英文请求。证据保存在 `desktop/data/validation/plugin-chain/`。
 
@@ -183,10 +187,13 @@ Google 模式是桌面的默认选项。插件模式跟随连接器扩展当前�
 
 英文配音新增 60 项检查覆盖本地生成、缓存、关闭、暂停、跳转、缓冲、重叠字幕、静音租约、用户音量修改和旧回调过滤。真实 Zira 合成检查生成了约 7.19 秒的非静音音频，首次总耗时约 0.40 秒，纯合成约 125 毫秒；真实 MainWindow＋System.Speech＋QMediaPlayer 在受控 B 站时钟中约 1.25 秒进入播放，暂停、短距离跳转及关闭恢复均通过，ASR 请求为 0。测试播放输出音量设为 0；没有把这些结果当作已登录真实 Chrome 的配音试听或完整联调。报告、WAV 与设置窗口画面保留在 `desktop/data/validation/dubbing/`。
 
+音高修复另增加 19 项检查。通过实际声音输出设备的 WASAPI 回录比较同一个 440 Hz 测试信号：旧 Qt 6.8.2 在 1.5 倍速时输出约 660.16 Hz；Qt 6.11.2 启用音高补偿后，1.5 倍速约 439.99 Hz，0.75 倍速约 440.04 Hz。真实 MainWindow＋System.Speech＋新版 Qt 的受控验证约 0.54 秒进入播放，短距离跳转定位 3001 ms，暂停、关闭恢复通过，ASR 请求仍为 0。证据保留在该目录的 `pitch-1791864620861287000/report.json` 和 `mainwindow-1791864811410326900/report.json`。这些是实际设备的音高检测和受控同步验证，没有声称主观听过用户的视频。
+
 开发验证命令（仓库根目录）：
 
 ```powershell
-& 'D:\ProjectsPycharm\MultiProjects\.venv\Scripts\python.exe' -B -m unittest discover -s desktop/tests -v
+& 'D:\dev\TrancyDesktop\.venv\Scripts\python.exe' -m pip install -r desktop/requirements-dev.txt
+& 'D:\dev\TrancyDesktop\.venv\Scripts\python.exe' -B -m unittest discover -s desktop/tests -v
 node --check assets/desktop-bridge-background.js
 node --check assets/desktop-bridge-content.js
 node --check assets/desktop-bridge-page.js
@@ -204,5 +211,6 @@ node --check assets/desktop-bridge-page.js
 | Google 请求失败 | 检查网络，点击“重试未完成字幕”，或选择连接器已经配置好的引擎 |
 | 英文配音等待连接器更新 | 重载 0.1.4 连接器、刷新 B 站页，重新生成字幕后开启配音 |
 | 本地英文语音不可用 | 检查 Windows 本地英语语音及声音输出设备；准备失败时播放原声 |
+| 配音提示需要保留音高的环境 | 使用更新后的 `.vbs`／`.cmd` 启动器；自建环境安装最新 `requirements.txt`，需要 Qt 6.10 以上 |
 | 缺字幕且模型启动失败 | 检查 SubtitleService、模型与解释器，修正后重试 |
 | 字幕挡住鼠标操作 | 锁定并开启鼠标穿透；需要移动时解锁 |

@@ -6,6 +6,9 @@ root = fso.GetParentFolderName(WScript.ScriptFullName)
 python = fso.BuildPath(root, ".venv\Scripts\pythonw.exe")
 app = fso.BuildPath(root, "app.py")
 If Not fso.FileExists(python) Then
+    python = "D:\dev\TrancyDesktop\.venv\Scripts\pythonw.exe"
+End If
+If Not fso.FileExists(python) Then
     python = "D:\ProjectsPycharm\MultiProjects\.venv\Scripts\pythonw.exe"
 End If
 If Not fso.FileExists(python) Then

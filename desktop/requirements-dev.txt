@@ -1,0 +1,3 @@
+-r requirements.txt
+# Audio extraction fixtures use arrays; the desktop UI does not need NumPy.
+numpy>=2,<3

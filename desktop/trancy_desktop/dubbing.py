@@ -45,6 +45,10 @@ class QtSpeechPlayer(QObject):
         self._player = None
         self._token = None
         self._prepared = False
+        self._clock = time.monotonic
+        self._aligned = False
+        self._drift_since = None
+        self._last_seek = -math.inf
 
     def prepare(self, path, token):
         from PyQt6.QtMultimedia import QAudioOutput, QMediaDevices, QMediaPlayer
@@ -53,6 +57,21 @@ class QtSpeechPlayer(QObject):
             self.failed.emit(dict(token=token, message="未找到可用的声音输出设备"))
             return
         player = QMediaPlayer(self)
+        # Qt 6.8 changes pitch along with playback speed. Long English
+        # translations must use the time stretcher, not that resampling path.
+        if (not hasattr(player, "pitchCompensationAvailability") or
+                player.pitchCompensationAvailability() ==
+                QMediaPlayer.PitchCompensationAvailability.Unavailable):
+            player.deleteLater()
+            self.failed.emit(dict(token=token, code="pitch_unavailable",
+                                  message="英文配音需要支持保留音高的 Qt 6.10 或更新环境"))
+            return
+        player.setPitchCompensation(True)
+        if not player.pitchCompensation():
+            player.deleteLater()
+            self.failed.emit(dict(token=token, code="pitch_unavailable",
+                                  message="当前音频播放器无法启用保留音高，请更新桌面环境"))
+            return
         output = QAudioOutput(player)
         player.setAudioOutput(output)
         self._player, self._token, self._prepared = player, token, False
@@ -84,8 +103,23 @@ class QtSpeechPlayer(QObject):
         from PyQt6.QtMultimedia import QMediaPlayer
         if abs(player.playbackRate() - rate) > .01:
             player.setPlaybackRate(rate)
-        if force or abs(player.position() - position_ms) > 260:
+        now = self._clock()
+        # Browser reports and Qt position notifications are not sample clocks.
+        # Seek once on entry or an explicit jump. Correct ordinary drift only
+        # after it stays large for a second, with a two-second seek cooldown.
+        drift = abs(player.position() - position_ms)
+        if drift > 750 * max(1., rate):
+            if self._drift_since is None:
+                self._drift_since = now
+        else:
+            self._drift_since = None
+        correct_drift = (not paused and self._drift_since is not None and
+                         now - self._drift_since >= 1. and now - self._last_seek >= 2.)
+        if force or not self._aligned or correct_drift:
             player.setPosition(max(0, int(position_ms)))
+            self._aligned = True
+            self._drift_since = None
+            self._last_seek = now
         if paused:
             if player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
                 player.pause()
@@ -99,6 +133,9 @@ class QtSpeechPlayer(QObject):
     def stop(self):
         player, self._player = self._player, None
         self._token, self._prepared = None, False
+        self._aligned = False
+        self._drift_since = None
+        self._last_seek = -math.inf
         if player is not None:
             player.stop()
             player.deleteLater()
@@ -336,7 +373,9 @@ class DubbingSession(QObject):
         if not self._active or not self._lease or not self.enabled:
             self.audio.pause()
             return
-        stretch = max(.85, min(self.MAX_STRETCH, sample["duration"] / max(.1, self._voice_end(cue) - cue["start"])))
+        # Short speech finishes naturally and leaves silence. Only a long
+        # translation needs acceleration; the player preserves its pitch.
+        stretch = max(1., min(self.MAX_STRETCH, sample["duration"] / max(.1, self._voice_end(cue) - cue["start"])))
         audio_seconds = max(0., position - cue["start"]) * stretch
         if audio_seconds >= sample["duration"]:
             self.audio.pause()
@@ -446,6 +485,11 @@ class DubbingSession(QObject):
 
     def _media_failed(self, event):
         if event.get("token") == self._media_token and self._media_token:
+            if event.get("code") == "pitch_unavailable":
+                self.enabled = False
+                self.stop()
+                self.disabled.emit(event["message"] + " · 已恢复原声")
+                return
             self._failures.add(self._clip_token)
             self._release()
             self.audio.stop()
