@@ -14,6 +14,7 @@ import math
 from pathlib import Path
 import re
 import secrets
+import socket
 import threading
 import time
 from urllib.parse import parse_qs, urlparse
@@ -33,6 +34,18 @@ DUBBING_REASONS = frozenset({"", "disabled", "bridge_disconnected", "lease_expir
                            "observer_unavailable", "request_timeout"})
 PLAYBACK_EVENTS = frozenset({"play", "pause", "ended", "seeking", "seeked", "waiting", "stalled",
                            "playing", "ratechange", "loadedmetadata", "emptied"})
+
+
+class ExclusiveHTTPServer(ThreadingHTTPServer):
+    # HTTPServer enables SO_REUSEADDR, which on Windows lets a second app
+    # silently bind the same port and receive only some connector requests.
+    allow_reuse_address = False
+    allow_reuse_port = False
+
+    def server_bind(self):
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
 
 
 def extension_id() -> str:
@@ -262,15 +275,16 @@ class BrowserBridge(QObject):
             def do_GET(self):
                 self._respond(405, {"error": "POST required"})
         try:
-            self._server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+            self._server = ExclusiveHTTPServer(("127.0.0.1", port), Handler)
             self._server.daemon_threads = True
             self.port = self._server.server_address[1]
             threading.Thread(target=self._server.serve_forever, name="browser-bridge", daemon=True).start()
             self.status_changed.emit(f"浏览器桥已启动：127.0.0.1:{self.port}，等待插件连接")
-        except OSError:
+        except OSError as error:
             self._server = None
-            self.status_changed.emit(f"浏览器桥端口 {port} 已被占用，请关闭另一个桌面字幕实例")
-            raise
+            message = f"浏览器连接端口 {port} 无法启动，请检查是否还有另一个桌面字幕窗口。"
+            self.status_changed.emit(message)
+            raise OSError(message) from error
 
     def stop(self):
         server, self._server = self._server, None

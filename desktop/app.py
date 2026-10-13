@@ -17,15 +17,33 @@ def main():
     app.setApplicationName("Trancy 桌面字幕")
     app.setOrganizationName("TrancyLocal")
     app.setQuitOnLastWindowClosed(True)
+    instance = None
     try:
+        from trancy_desktop.instance import DesktopInstance
+        instance = DesktopInstance(parent=app)
+        if not instance.acquire():
+            return 0
         from trancy_desktop.window import MainWindow
         window = MainWindow()
+
+        def activate():
+            if window.isMinimized():
+                window.showNormal()
+            else:
+                window.show()
+            window.raise_()
+            window.activateWindow()
+
+        instance.activated.connect(activate)
         window.show()
+        return app.exec()
     except Exception as error:
         logging.exception("Desktop initialization failed")
         QMessageBox.critical(None, "Trancy 桌面字幕", f"启动失败：{error}\n诊断日志：{DATA / 'logs' / 'desktop.log'}")
         return 1
-    return app.exec()
+    finally:
+        if instance is not None:
+            instance.close()
 
 
 if __name__ == "__main__":

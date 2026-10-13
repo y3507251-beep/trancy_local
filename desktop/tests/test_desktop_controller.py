@@ -305,6 +305,21 @@ class ControllerTests(unittest.TestCase):
             _, callback = self.scheduled.popleft()
             callback()
 
+    def test_bridge_start_failure_is_not_reported_as_missing_extension(self):
+        reason = "浏览器连接端口 18766 无法启动，请检查是否还有另一个桌面字幕窗口。"
+        with patch.object(FakeBridge, "start", side_effect=OSError(reason)):
+            blocked = controller.MainWindow(MemorySettings())
+        try:
+            blocked.tick.stop()
+            blocked.start_browser()
+            self.assertEqual(blocked.web_status.text(), reason)
+            self.assertEqual(blocked.status.text(), reason)
+            self.assertEqual(blocked.mode, "idle")
+            self.assertEqual(blocked.asr.requests, [])
+        finally:
+            blocked.hide()
+            blocked.deleteLater()
+
     def test_stale_asr_result_is_cleaned_without_rewriting_new_source(self):
         w = self.window
         w.generation, w.mode = 4, "potplayer"

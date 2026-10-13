@@ -18,6 +18,8 @@ Windows / PyQt6 桌面应用：设置窗口与可在整个桌面自由拖动的�
 - 查看启动错误：双击 [启动桌面字幕.cmd](启动桌面字幕.cmd)。
 - 启动诊断日志：`desktop/data/logs/desktop.log`。
 
+重复双击启动器会显示已经运行的设置窗口，不会再创建第二个桌面进程。浏览器连接端口由单个实例独占，避免插件连接到一个窗口、另一个窗口却一直提示等待连接。
+
 启动器优先使用 `desktop/.venv/Scripts/` 下的独立解释器；其次使用当前电脑的 `D:\dev\TrancyDesktop\.venv\Scripts/`。本机已为英文配音建立这个独立环境，使用 Qt 6.11.2，避免继续调用旧 Qt 6.8 播放器。两者都不存在时才回退到原有的 `D:\ProjectsPycharm\MultiProjects\.venv\Scripts/`；旧环境可以显示字幕，但不再使用会改变音高的配音变速。
 
 在新电脑安装桌面界面依赖，可在 `desktop` 目录执行：

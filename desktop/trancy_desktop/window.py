@@ -136,10 +136,13 @@ class MainWindow(QMainWindow):
         self.downloader.failed.connect(self._download_failed)
         self.recycled.connect(self._recycle_done)
         self.pot.start()
+        self._bridge_error = ""
         try:
             self.bridge.start(port=18766)
         except Exception as error:
-            self.web_status.setText(str(error))
+            self._bridge_error = str(error)
+            self.web_status.setText(self._bridge_error)
+            self._status(self._bridge_error)
         self.tick = QTimer(self)
         self.tick.setInterval(120)
         self.tick.timeout.connect(self._tick)
@@ -523,6 +526,9 @@ class MainWindow(QMainWindow):
         return next((v for v in self.bridge.videos() if self._browser_tab(v) == tab), None)
 
     def start_browser(self):
+        if self._bridge_error:
+            self._status(self._bridge_error)
+            return
         video = self._selected_browser()
         if not video:
             self._status("请先加载本项目的浏览器扩展，并打开 B 站或 YouTube 视频。")

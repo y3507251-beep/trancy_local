@@ -111,6 +111,24 @@ class BridgeTests(unittest.TestCase):
         with urlopen(request, timeout=3) as response:
             return json.load(response)
 
+    def test_duplicate_bridge_cannot_receive_the_existing_instances_requests(self):
+        duplicate = BrowserBridge()
+        try:
+            with self.assertRaises(OSError):
+                duplicate.start(self.bridge.port)
+            self.assertIsNone(duplicate._server)
+            self.assertIn("jobs", self.post("/v1/poll", {}))
+        finally:
+            duplicate.stop()
+
+    def test_restart_reuses_port_after_serving_connector_requests(self):
+        port = self.bridge.port
+        self.post("/v1/poll", {})
+        self.bridge.stop()
+        self.bridge.start(port)
+        self.headers.pop("X-Trancy-Session")
+        self.assertIn("session", self.post("/v1/hello", {}))
+
     def test_origin_session_and_unknown_endpoints(self):
         for headers in (dict(self.headers, Origin="https://evil.test"),
                         {k: v for k, v in self.headers.items() if k != "X-Trancy-Desktop"},
