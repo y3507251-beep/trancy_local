@@ -23,7 +23,7 @@ class DubbingBridgeTests(unittest.TestCase):
         self.bridge._server = object()  # Dispatch-only: no real HTTP listener.
         self.client = "bilibili-dubbing-test-client"
         self.session = self.bridge._dispatch("/v1/hello", {
-            "client_id": self.client, "connector_version": "0.1.6"}, "")[1]["session"]
+            "client_id": self.client, "connector_version": "0.1.5"}, "")[1]["session"]
         self.post("/v1/video", {"tab_id": 10, "seq": 1, "video": VIDEO})
         self.video = self.bridge.latest()
         self.events = []
@@ -175,71 +175,18 @@ class DubbingBridgeTests(unittest.TestCase):
             self.assertTrue(event["paused"])
             self.assertIs(event["ended"], ended is True)
 
-    def rate_capable_video(self):
-        self.post("/v1/video", {"tab_id": 10, "seq": 2, "video": dict(VIDEO, rate_control_protocol=1)})
-        return self.bridge.latest()
-
-    def test_basic_dubbing_does_not_request_rate_and_old_pages_keep_working(self):
-        request = self.bridge.set_dubbing(self.video, True, LEASE)
-        job = self.post("/v1/poll", {})["dubbing_jobs"][0]
-        self.assertNotIn("playback_rate", job)
-        self.assertTrue(self.result(request)["accepted"])
-        self.assertIsNone(self.events[-1]["original_rate"])
-        self.assertEqual(self.video["rate_control_protocol"], 0)
-
-    def test_rate_control_requires_current_page_capability_and_strict_bounded_numbers(self):
-        with self.assertRaisesRegex(ValueError, "0.1.6"):
-            self.bridge.set_dubbing(dict(self.video, rate_control_protocol=1), True, LEASE, playback_rate=.75)
-        self.assertEqual(normalize_video(dict(VIDEO, rate_control_protocol=True))["rate_control_protocol"], 0)
-        video = self.rate_capable_video()
-        self.assertEqual(video["rate_control_protocol"], 1)
-        for rate in (False, True, "1", .099, 4.001, float("nan"), float("inf"), {}, 10 ** 1000):
-            with self.subTest(rate=str(rate)[:20]), self.assertRaises(ValueError):
-                self.bridge.set_dubbing(video, True, LEASE, playback_rate=rate)
-        self.assertEqual(self.post("/v1/poll", {})["dubbing_jobs"], [])
-        for rate in (.1, 4):
-            self.bridge.set_dubbing(video, True, LEASE, playback_rate=rate)
-            self.assertEqual(self.post("/v1/poll", {})["dubbing_jobs"][0]["playback_rate"], rate)
-
-    def test_rate_renewal_supersedes_old_ack_and_disable_has_no_rate_side_effect(self):
-        video = self.rate_capable_video()
-        first = self.bridge.set_dubbing(video, True, LEASE, playback_rate=.8)
-        self.post("/v1/poll", {})
-        second = self.bridge.set_dubbing(video, True, LEASE, playback_rate=.6)
-        job = self.post("/v1/poll", {})["dubbing_jobs"][0]
-        self.assertEqual((job["id"], job["playback_rate"]), (second, .6))
-        self.assertFalse(self.result(first, rate=.8, original_rate=1.25)["accepted"])
-        self.assertTrue(self.result(second, rate=.6, original_rate=1.25)["accepted"])
-        self.assertEqual((self.events[-1]["rate"], self.events[-1]["original_rate"]), (.6, 1.25))
-        release = self.bridge.set_dubbing(video, False, LEASE, playback_rate=1)
-        self.assertNotIn("playback_rate", self.post("/v1/poll", {})["dubbing_jobs"][0])
-        self.assertTrue(self.result(release, status="restored", rate=1.25, original_rate=1.25)["accepted"])
-
-    def test_original_rate_is_sanitized_and_user_rate_override_retires_lease(self):
-        video = self.rate_capable_video()
-        for value in (1.25, 16, None, True, "1.25", 0, -1, 16.1, float("nan"), float("inf"), 10 ** 1000):
-            request = self.bridge.set_dubbing(video, True, LEASE, playback_rate=.75)
-            self.assertTrue(self.result(request, original_rate=value)["accepted"])
-            expected = value if type(value) in (int, float) and 0 < value <= 16 else None
-            self.assertEqual(self.events[-1]["original_rate"], expected)
-        self.assertTrue(self.result(request, status="user_override", reason="user_rate", rate=1.75, original_rate=1.25)["accepted"])
-        self.assertEqual((self.events[-1]["reason"], self.events[-1]["rate"]), ("user_rate", 1.75))
-        self.assertFalse(self.result(request, rate=.75)["accepted"])
-
 
 PAGE_SETUP = r'''
 const assert=require('node:assert/strict'),fs=require('node:fs'),vm=require('node:vm');
 const pageCode=fs.readFileSync('assets/desktop-bridge-page.js','utf8');
 function makeMedia(muted=false,volume=.8){
- const listeners=new Map();let currentMuted=muted,currentVolume=volume,currentRate=1;
- const media={currentTime:5,duration:120,paused:false,ended:false,readyState:4,seeking:false,rateWrites:[],deferRateEvents:false,
+ const listeners=new Map();let currentMuted=muted,currentVolume=volume;
+ const media={currentTime:5,duration:120,paused:false,ended:false,readyState:4,playbackRate:1,seeking:false,
   addEventListener:(name,fn)=>{const list=listeners.get(name)||[];list.push(fn);listeners.set(name,list);},
   removeEventListener:(name,fn)=>listeners.set(name,(listeners.get(name)||[]).filter(f=>f!==fn)),
-  emit:name=>{for(const fn of [...listeners.get(name)||[]])fn();},setRateSilently:v=>{currentRate=v;}};
+  emit:name=>{for(const fn of [...listeners.get(name)||[]])fn();}};
  Object.defineProperties(media,{muted:{get:()=>currentMuted,set:v=>{const changed=currentMuted!==v;currentMuted=v;if(changed)media.emit('volumechange');}},
-  volume:{get:()=>currentVolume,set:v=>{const changed=currentVolume!==v;currentVolume=v;if(changed)media.emit('volumechange');}},
-  playbackRate:{configurable:true,get:()=>currentRate,set:v=>{const changed=currentRate!==v;currentRate=v;media.rateWrites.push(v);
-   if(changed&&!media.deferRateEvents)media.emit('ratechange');}}});
+  volume:{get:()=>currentVolume,set:v=>{const changed=currentVolume!==v;currentVolume=v;if(changed)media.emit('volumechange');}}});
  return media;
 }
 function setup(muted=false){
@@ -344,111 +291,6 @@ report=page.videos().at(-1).video;assert.equal(report.ended,false);assert.equal(
 page.command(true,'d'.repeat(32));assert.equal(page.results().at(-1).ended,false);assert.equal(page.results().at(-1).seeking,true);
 ''')
 
-    def test_basic_mute_does_not_capture_or_change_user_speed(self):
-        self.run_node(r'''
-const page=setup();page.media.setRateSilently(1.25);page.command(true);
-assert.equal(page.media.playbackRate,1.25);assert.deepEqual(page.media.rateWrites,[]);
-assert.equal(page.results().at(-1).original_rate,null);assert.equal(page.videos().at(-1).video.rate_control_protocol,1);
-page.media.playbackRate=1.75;assert.equal(page.media.muted,true);assert.equal(page.results().at(-1).status,'active');
-page.command(false,'c'.repeat(32));assert.equal(page.media.muted,false);assert.equal(page.media.playbackRate,1.75);
-assert.deepEqual(page.media.rateWrites,[1.75]);assert.equal(page.results().at(-1).original_rate,null);
-''')
-
-    def test_rate_is_captured_on_first_explicit_control_and_renewals_keep_that_baseline(self):
-        self.run_node(r'''
-const page=setup();page.media.setRateSilently(1.25);page.command(true);page.media.playbackRate=1.75;
-page.command(true,'c'.repeat(32),undefined,{playback_rate:.6});
-let ack=page.results().at(-1);assert.equal(ack.status,'active');assert.equal(ack.original_rate,1.75);assert.equal(ack.rate,.6);
-page.command(true,'d'.repeat(32),undefined,{playback_rate:.8});
-ack=page.results().at(-1);assert.equal(ack.status,'active');assert.equal(ack.original_rate,1.75);assert.equal(ack.rate,.8);
-page.command(true,'e'.repeat(32));assert.equal(page.media.playbackRate,.8);assert.equal(page.results().at(-1).original_rate,1.75);
-page.command(false,'f'.repeat(32));assert.equal(page.media.playbackRate,1.75);assert.equal(page.media.muted,false);
-assert.equal(page.results().at(-1).rate,1.75);
-''')
-
-    def test_our_synchronous_and_delayed_rate_events_do_not_cancel_the_lease(self):
-        self.run_node(r'''
-for(const delayed of [false,true]){
- const page=setup();page.media.deferRateEvents=delayed;page.command(true,undefined,undefined,{playback_rate:.5});
- page.command(true,'c'.repeat(32),undefined,{playback_rate:.7});page.media.emit('ratechange');page.media.emit('ratechange');
- assert.equal(page.media.playbackRate,.7);assert.equal(page.media.muted,true);
- assert.equal(page.results().some(r=>r.status==='user_override'),false);
- page.command(false,'d'.repeat(32));assert.equal(page.media.playbackRate,1);assert.equal(page.media.muted,false);
-}
-''')
-
-    def test_user_rate_override_preserves_new_speed_restores_mute_and_rejects_late_renewal(self):
-        self.run_node(r'''
-for(const delayed of [false,true]){
- const page=setup();page.media.setRateSilently(1.25);page.command(true,undefined,undefined,{playback_rate:.7});
- if(delayed){page.media.setRateSilently(1.8);page.command(true,'c'.repeat(32),undefined,{playback_rate:.6});}
- else page.media.playbackRate=1.8;
- const ack=page.results().at(-1);assert.equal(ack.status,'user_override');assert.equal(ack.reason,'user_rate');
- assert.equal(ack.original_rate,1.25);assert.equal(ack.rate,1.8);assert.equal(page.media.muted,false);
- page.command(true,'d'.repeat(32),undefined,{playback_rate:.5});
- assert.equal(page.results().at(-1).reason,'retired_lease');assert.equal(page.media.playbackRate,1.8);assert.equal(page.media.muted,false);
-}
-''')
-
-    def test_volume_or_unmute_override_restores_owned_speed_and_preserves_user_changes(self):
-        self.run_node(r'''
-for(const kind of ['volume','unmute','rate_then_volume']){
- const page=setup();page.media.setRateSilently(1.25);page.command(true,undefined,undefined,{playback_rate:.7});
- if(kind==='unmute')page.media.muted=false;
- else{if(kind==='rate_then_volume')page.media.setRateSilently(1.8);page.media.volume=.35;}
- assert.equal(page.results().at(-1).status,'user_override');assert.equal(page.media.muted,false);
- assert.equal(page.media.playbackRate,kind==='rate_then_volume'?1.8:1.25);
- assert.equal(page.media.volume,kind==='unmute'?.8:.35);
-}
-''')
-
-    def test_all_terminal_paths_restore_owned_rate_and_replaced_player_keeps_its_own_rate(self):
-        self.run_node(r'''
-for(const action of ['disable','disconnect','expiry','ad','pagehide','replace','new_lease']){
- const page=setup();page.media.setRateSilently(1.25);page.command(true,undefined,undefined,{playback_rate:.6});
- const old=page.media;
- if(action==='disable')page.command(false,'c'.repeat(32));
- if(action==='disconnect')page.command(false,'c'.repeat(32),undefined,{reason:'bridge_disconnected'});
- if(action==='expiry')page.advance(3000);
- if(action==='ad'){page.ad=true;page.report();}
- if(action==='pagehide')page.emit('pagehide');
- if(action==='replace'){page.media=makeMedia();page.media.setRateSilently(1.8);page.report();assert.equal(page.media.playbackRate,1.8);}
- if(action==='new_lease'){
-  page.command(true,'c'.repeat(32),'d'.repeat(32),{playback_rate:.9});assert.equal(page.results().at(-1).original_rate,1.25);
-  page.command(false,'e'.repeat(32),'d'.repeat(32));
- }
- assert.equal(old.playbackRate,1.25,action);assert.equal(old.muted,false,action);
-}
-const page=setup();page.command(true,undefined,undefined,{playback_rate:.7});page.media.setRateSilently(1.9);
-page.command(false,'c'.repeat(32));assert.equal(page.media.playbackRate,1.9);assert.equal(page.media.muted,false);
-''')
-
-    def test_rate_assignment_failure_restores_the_previous_owned_rate_and_mute(self):
-        self.run_node(r'''
-for(const existingRate of [false,true])for(const ignore of [false,true]){
- const page=setup();page.media.setRateSilently(1.25);
- if(existingRate)page.command(true,undefined,undefined,{playback_rate:.7});
- let current=page.media.playbackRate;
- Object.defineProperty(page.media,'playbackRate',{get:()=>current,set:value=>{if(value===.6){if(ignore)return;throw Error('unsupported');}
-  current=value;page.media.emit('ratechange');}});
- page.command(true,'c'.repeat(32),undefined,{playback_rate:.6});
- assert.equal(page.results().at(-1).status,'error');assert.equal(page.results().at(-1).reason,'rate_unavailable');
- assert.equal(page.media.playbackRate,1.25);assert.equal(page.media.muted,false);
-}
-''')
-
-    def test_invalid_rate_wrong_identity_and_retired_commands_never_change_rate(self):
-        self.run_node(r'''
-for(const rate of [true,false,'1',null,undefined,NaN,Infinity,-1,0,.09,4.01]){
- const page=setup();page.command(true,undefined,undefined,{playback_rate:rate});
- assert.equal(page.media.muted,false);assert.equal(page.media.playbackRate,1);assert.deepEqual(page.media.rateWrites,[]);
-}
-for(const fields of [{document_start:101},{video:{platform:'bilibili',video_id:'BV1xx411c7mD',page:2,cid:'99999'}}]){
- const page=setup();page.command(true,undefined,undefined,{playback_rate:.5,...fields});
- assert.equal(page.media.muted,false);assert.equal(page.media.playbackRate,1);
-}
-''')
-
     def test_ad_and_pagehide_restore_without_starting_or_seeking_video(self):
         self.run_node(r'''
 const page=setup();page.command(true);page.ad=true;page.report();assert.equal(page.media.muted,false);
@@ -468,7 +310,7 @@ function setup(){
   setTimeout:fn=>{timer=fn;return 1;},clearTimeout:()=>{},
   fetch:async(url,options)=>{const body=JSON.parse(options.body);posts.push({url,body});if(fail)throw Error('offline');
    return{ok:true,json:async()=>url.endsWith('/hello')?{session:'local-session'}:url.endsWith('/poll')?{jobs:[],caption_jobs:[],dubbing_jobs:queue.splice(0)}:{accepted:true}};},
-  chrome:{runtime:{id:'desktop-extension',getManifest:()=>({name:'Trancy 桌面字幕连接器',version:'0.1.6'}),
+  chrome:{runtime:{id:'desktop-extension',getManifest:()=>({name:'Trancy 桌面字幕连接器',version:'0.1.5'}),
    getPlatformInfo:async()=>({os:'win'}),onMessage:{addListener:fn=>{listener=fn;}}},
    tabs:{sendMessage:async(tabId,message,options)=>{commands.push({tabId,message,options});return{accepted:true};},
     onRemoved:{addListener:()=>{}},onUpdated:{addListener:()=>{}}},alarms:{onAlarm:{addListener:()=>{}},create:()=>{}}}};
@@ -526,57 +368,6 @@ for(const ended of [true,false,'true',undefined]){
 }
 ''')
 
-    def test_rate_jobs_require_capability_and_forward_only_valid_optional_rate(self):
-        self.run_node(r'''
-for(const protocol of [undefined,0,true,'1',1]){
- const bridge=setup();await flush();bridge.emit({kind:'trancy-desktop-report-v1',href:bridge.video.url,document_start:100,
-  sequence:1,video:{...bridge.video,rate_control_protocol:protocol}});
- bridge.queue.push({id:'a'.repeat(32),lease_id:'b'.repeat(32),tab_id:10,document_start:100,
-  video:bridge.video,enabled:true,playback_rate:.7,token:'secret'});await bridge.tick();
- const report=bridge.posts.filter(p=>p.url.endsWith('/video')).at(-1);
- assert.equal(report.body.video.rate_control_protocol,protocol===1?1:0);
- if(protocol===1){assert.equal(bridge.commands.length,1);assert.equal(bridge.commands[0].message.playback_rate,.7);
-  assert.equal(JSON.stringify(bridge.commands[0].message).includes('secret'),false);}
- else assert.equal(bridge.commands.length,0);
-}
-for(const rate of [false,true,'1',null,NaN,Infinity,.09,4.01]){
- const bridge=setup();await flush();bridge.emit({kind:'trancy-desktop-report-v1',href:bridge.video.url,document_start:100,
-  sequence:1,video:{...bridge.video,rate_control_protocol:1}});
- bridge.queue.push({id:'a'.repeat(32),lease_id:'b'.repeat(32),tab_id:10,document_start:100,
-  video:bridge.video,enabled:true,playback_rate:rate});await bridge.tick();assert.equal(bridge.commands.length,0);
-}
-''')
-
-    def test_rate_ack_returns_actual_and_original_speed_and_disconnect_has_no_requested_rate(self):
-        self.run_node(r'''
-const bridge=setup();await flush();bridge.emit({kind:'trancy-desktop-report-v1',href:bridge.video.url,document_start:100,
- sequence:1,video:{...bridge.video,rate_control_protocol:1}});let sequence=1;
-for(const baseline of [1.25,'1.25',true,null,Infinity]){
- const job={id:String(++sequence).repeat(32),lease_id:'b'.repeat(32),tab_id:10,document_start:100,
-  video:bridge.video,enabled:true,playback_rate:.7};bridge.queue.push(job);await bridge.tick();
- bridge.emit({kind:'trancy-desktop-dubbing-report-v1',href:bridge.video.url,document_start:100,sequence,
-  request_id:job.id,lease_id:job.lease_id,video:bridge.video,status:'active',position:5,paused:false,
-  rate:.7,original_rate:baseline});await flush();
- const ack=bridge.posts.filter(p=>p.url.endsWith('/dubbing')).at(-1);
- assert.equal(ack.body.rate,.7);assert.equal(ack.body.original_rate,baseline===1.25?1.25:null);
-}
-bridge.offline();await bridge.tick();const release=bridge.commands.at(-1).message;
-assert.equal(release.enabled,false);assert.equal('playback_rate'in release,false);
-assert.equal(release.reason,'bridge_disconnected');
-''')
-
-    def test_user_rate_override_reason_is_forwarded_and_late_ack_is_rejected(self):
-        self.run_node(r'''
-const bridge=setup();await flush();bridge.emit({kind:'trancy-desktop-report-v1',href:bridge.video.url,document_start:100,
- sequence:1,video:{...bridge.video,rate_control_protocol:1}});
-const job={id:'a'.repeat(32),lease_id:'b'.repeat(32),tab_id:10,document_start:100,video:bridge.video,enabled:true,playback_rate:.7};
-bridge.queue.push(job);await bridge.tick();const result={kind:'trancy-desktop-dubbing-report-v1',href:bridge.video.url,
- document_start:100,request_id:job.id,lease_id:job.lease_id,video:bridge.video,status:'user_override',reason:'user_rate',rate:1.8,original_rate:1.25};
-bridge.emit({...result,sequence:2});await flush();const acks=()=>bridge.posts.filter(p=>p.url.endsWith('/dubbing'));
-assert.equal(acks().at(-1).body.reason,'user_rate');assert.equal(acks().at(-1).body.rate,1.8);const count=acks().length;
-bridge.emit({...result,sequence:3,status:'active',rate:.7});await flush();assert.equal(acks().length,count);
-''')
-
     def test_selected_tab_control_ack_and_disconnect_release(self):
         self.run_node(r'''
 const bridge=setup();await flush();bridge.emit({kind:'trancy-desktop-report-v1',href:bridge.video.url,document_start:100,sequence:1,video:bridge.video});
@@ -604,39 +395,6 @@ for(const badVideo of [{dubbing_protocol:0},{cid:'99999'}]){
 
 @unittest.skipUnless(shutil.which("node"), "Node.js is required for the extension sandbox")
 class DubbingContentTests(unittest.TestCase):
-    def test_rate_command_whitelist_and_original_rate_ack_are_strict(self):
-        script = r'''
-const assert=require('node:assert/strict'),fs=require('node:fs'),vm=require('node:vm');
-let runtimeListener,windowListener;const sent=[],posted=[];
-const ctx={performance:{timeOrigin:100},location:new URL('https://www.bilibili.com/video/BV1xx411c7mD/?p=2'),setTimeout:()=>{},
- chrome:{runtime:{id:'desktop-extension',onMessage:{addListener:fn=>{runtimeListener=fn;}},sendMessage:async m=>{sent.push(m);}}},
- addEventListener:(_,fn)=>{windowListener=fn;},postMessage:m=>posted.push(m)};
-ctx.window=ctx;ctx.top=ctx;vm.createContext(ctx);vm.runInContext(fs.readFileSync('assets/desktop-bridge-content.js','utf8'),ctx);
-ctx.__windowListener=windowListener;vm.runInContext(`__deliver=m=>__windowListener({source:window,origin:location.origin,data:m});`,ctx);
-const video={platform:'bilibili',video_id:'BV1xx411c7mD',url:ctx.location.href,page:2,cid:'12345'};
-const command={kind:'trancy-desktop-dubbing-request-v1',request_id:'a'.repeat(32),lease_id:'b'.repeat(32),video,document_start:100,enabled:true};
-for(const rate of [false,true,'1',null,undefined,NaN,Infinity,.09,4.01])
- runtimeListener({...command,playback_rate:rate},{id:'desktop-extension'},()=>{});
-assert.equal(posted.length,0);
-let sequence=0;
-for(const original_rate of [1.25,'1.25',true,null,Infinity]){
- const request_id=String(++sequence).repeat(32);
- runtimeListener({...command,request_id,playback_rate:.7,token:'secret'},{id:'desktop-extension'},()=>{});
- assert.equal(posted.at(-1).playback_rate,.7);assert.equal(JSON.stringify(posted.at(-1)).includes('secret'),false);
- ctx.__deliver({kind:'trancy-desktop-dubbing-v1',href:ctx.location.href,sequence,document_start:100,request_id,
-  lease_id:command.lease_id,video,status:'active',position:5,paused:false,rate:.7,original_rate});
- assert.equal(sent.at(-1).rate,.7);assert.equal(sent.at(-1).original_rate,original_rate===1.25?1.25:null);
-}
-runtimeListener({...command,request_id:'c'.repeat(32)},{id:'desktop-extension'},()=>{});
-assert.equal('playback_rate'in posted.at(-1),false);
-ctx.__deliver({kind:'trancy-desktop-dubbing-v1',href:ctx.location.href,sequence:++sequence,document_start:100,request_id:'c'.repeat(32),
- lease_id:command.lease_id,video,status:'user_override',reason:'user_rate',position:5,rate:1.8,original_rate:1.25});
-assert.equal(sent.at(-1).reason,'user_rate');assert.equal(sent.at(-1).rate,1.8);
-'''
-        result = subprocess.run([shutil.which("node"), "-e", script], cwd=Path(__file__).resolve().parents[2],
-                                capture_output=True, text=True, timeout=10)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-
     def test_content_relay_preserves_end_in_periodic_video_reports_and_dubbing_ack(self):
         script = r'''
 const assert=require('node:assert/strict'),fs=require('node:fs'),vm=require('node:vm');

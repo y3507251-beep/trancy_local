@@ -586,7 +586,6 @@
       position: Number.isFinite(video?.currentTime) ? video.currentTime : 0,
       paused: Boolean(video?.paused || video?.ended), ended: video?.ended === true,
       rate: Number(video?.playbackRate) || 1,
-      original_rate: lease.original_rate ?? null,
       seeking: Boolean(video?.seeking), buffering: Boolean(waitingForPlayback || video?.readyState < 3),
       seek_serial: seekSerial}, location.origin);
   }
@@ -596,26 +595,13 @@
     while (retiredDubbingLeases.size > 64) retiredDubbingLeases.delete(retiredDubbingLeases.values().next().value);
   }
 
-  function sameRate(left, right) {
-    return typeof left === "number" && typeof right === "number" &&
-      Number.isFinite(left) && Number.isFinite(right) && Math.abs(left - right) < 1e-6;
-  }
-
-  function userChangedRate(lease) {
-    return lease.applied_rate !== null && !sameRate(lease.video.playbackRate, lease.applied_rate);
-  }
-
   function restoreDubbing(status = "restored", reason = "disabled", userOverride = false) {
     const lease = dubbingLease;
     if (!lease) return;
     dubbingLease = null;
     clearTimeout(lease.timer);
     retireDubbing(lease.lease_id);
-    // Volume is never changed. Restore an explicitly leased playback rate
-    // only while its last applied value still belongs to us.
-    if (lease.original_rate !== null && sameRate(lease.video.playbackRate, lease.applied_rate)) {
-      try { lease.video.playbackRate = lease.original_rate; } catch (_) { /* Detached or unavailable media. */ }
-    }
+    // We own only the temporary mute. Volume is never changed by the bridge.
     // A user unmute is left intact; a volume-only edit keeps their new volume
     // while removing our temporary mute before relinquishing control.
     if (lease.video.muted === true && (!userOverride || lease.video.volume !== lease.volume)) {
@@ -632,8 +618,6 @@
       restoreDubbing("expired", "lease_expired");
     } else if (found.ad_playing) {
       restoreDubbing("restored", "ad_playing");
-    } else if (userChangedRate(dubbingLease)) {
-      restoreDubbing("user_override", "user_rate");
     }
   }
 
@@ -643,9 +627,6 @@
         message.document_start !== docStart || !/^[a-f0-9]{32}$/.test(message.request_id || "") ||
         !/^[a-f0-9]{32}$/.test(message.lease_id || "") || typeof message.enabled !== "boolean" ||
         message.video?.platform !== "bilibili") return;
-    const hasRate = Object.hasOwn(message, "playback_rate");
-    if (hasRate && (typeof message.playback_rate !== "number" || !Number.isFinite(message.playback_rate) ||
-        message.playback_rate < .1 || message.playback_rate > 4)) return;
     const identity = pageIdentity(), found = identity && currentVideo(identity);
     const requested = {request_id: message.request_id, lease_id: message.lease_id, identity: message.video, video: found?.video};
     if (!message.enabled) {
@@ -666,45 +647,15 @@
       dubbingReport(requested, "error", "retired_lease");
       return;
     }
-    // A queued renewal must not overwrite a user's change that occurred
-    // before the browser's asynchronous ratechange event was delivered.
-    if (dubbingLease?.lease_id === message.lease_id && userChangedRate(dubbingLease)) {
-      dubbingLease.request_id = message.request_id;
-      restoreDubbing("user_override", "user_rate");
-      return;
-    }
     if (dubbingLease && (dubbingLease.lease_id !== message.lease_id || dubbingLease.video !== found.video)) {
       restoreDubbing("restored", "replaced");
     }
     if (!dubbingLease) {
       dubbingLease = {...requested, identity: dubbingIdentity(found), muted: found.video.muted === true,
-        volume: Number(found.video.volume), original_rate: null, applied_rate: null, timer: null};
+        volume: Number(found.video.volume), timer: null};
       found.video.muted = true;
     }
     dubbingLease.request_id = message.request_id;
-    if (hasRate) {
-      const lease = dubbingLease;
-      if (lease.original_rate === null) lease.original_rate = lease.video.playbackRate;
-      const previousApplied = lease.applied_rate;
-      // Set ownership before assignment: some players dispatch ratechange
-      // synchronously, and ordinary HTML media dispatches it asynchronously.
-      lease.applied_rate = message.playback_rate;
-      try {
-        if (!sameRate(lease.video.playbackRate, message.playback_rate)) lease.video.playbackRate = message.playback_rate;
-      } catch (_) {
-        lease.applied_rate = previousApplied;
-        if (dubbingLease === lease) restoreDubbing("error", "rate_unavailable");
-        return;
-      }
-      if (dubbingLease !== lease) return;
-      if (!sameRate(lease.video.playbackRate, message.playback_rate)) {
-        // A media implementation may ignore a new value without throwing.
-        // Retain ownership of the prior applied rate so failure can undo it.
-        if (sameRate(lease.video.playbackRate, previousApplied)) lease.applied_rate = previousApplied;
-        restoreDubbing("error", "rate_unavailable");
-        return;
-      }
-    }
     dubbingLease.expires = Date.now() + 3000;
     clearTimeout(dubbingLease.timer);
     const leaseId = dubbingLease.lease_id;
@@ -725,9 +676,6 @@
     if (!video?.addEventListener) return;
     for (const kind of playbackEvents) {
       const handler = () => {
-        if (kind === "ratechange" && dubbingLease?.video === video && userChangedRate(dubbingLease)) {
-          restoreDubbing("user_override", "user_rate");
-        }
         if (kind === "seeking") seekSerial++;
         if (["waiting", "stalled", "emptied"].includes(kind)) waitingForPlayback = true;
         if (["playing", "loadedmetadata"].includes(kind)) waitingForPlayback = false;
@@ -759,7 +707,7 @@
           paused: video.paused || video.ended || video.readyState < 2, ended: video.ended === true,
           rate: video.playbackRate,
           seeking: Boolean(video.seeking), buffering: Boolean(waitingForPlayback || video.readyState < 3),
-          seek_serial: seekSerial, dubbing_protocol: 1, rate_control_protocol: 1,
+          seek_serial: seekSerial, dubbing_protocol: 1,
           playback_event: playbackEvents.includes(playbackEvent) ? playbackEvent : "",
           active: document.visibilityState === "visible"};
       }
