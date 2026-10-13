@@ -7,7 +7,7 @@ from pathlib import Path
 import sys
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 import uuid
 import wave
 
@@ -46,12 +46,13 @@ class LegacyMediaPlayer:
 
     def __init__(self, parent=None):
         self.mediaStatusChanged, self.errorOccurred = Signal(), Signal()
+        self.positionChanged = Signal()
         self.calls = []
         self.current_position, self.current_rate = 0, 1.
         self.current_duration = 4000
         self.current_status = self.MediaStatus.LoadedMedia
         self.state = self.PlaybackState.StoppedState
-        self.output = None
+        self.output = MagicMock()
 
     def position(self):
         return self.current_position
@@ -94,6 +95,9 @@ class LegacyMediaPlayer:
     def setAudioOutput(self, output):
         self.output = output
         self.calls.append(("output",))
+
+    def audioOutput(self):
+        return self.output
 
     def setSource(self, source):
         self.calls.append(("source", source.toLocalFile()))
@@ -223,6 +227,52 @@ class QtSpeechPlayerTests(unittest.TestCase):
             self.audio.align(self.media.current_position + jitter, 1, False)
         self.assertEqual(self.seeks(), [0])
         self.assertEqual(self.media.calls.count(("play",)), 1)
+
+    def test_muted_following_sentence_warms_and_is_promoted_without_reloading(self):
+        self.prepare_with(self.media)
+        self.media.mediaStatusChanged.emit(self.media.MediaStatus.LoadedMedia)
+        self.audio.align(0, 1, False, force=True)
+        following = PitchMediaPlayer()
+        factory = type("PreloadedMediaPlayer", (PitchMediaPlayer,),
+                       {"__new__": lambda _cls, *_args, **_kwargs: following})
+        with patch.object(QtMultimedia, "QMediaPlayer", factory), \
+                patch.object(QtMultimedia.QMediaDevices, "audioOutputs", return_value=[object()]), \
+                patch.object(QtMultimedia, "QAudioOutput"):
+            self.audio.preload("C:/fixture/following.wav")
+        following.mediaStatusChanged.emit(following.MediaStatus.LoadedMedia)
+        self.assertIs(self.audio._player, self.media)
+        following.output.setMuted.assert_called_once_with(True)
+        self.assertIn(("play",), following.calls)
+        self.assertEqual(self.prepared, [dict(token="clip")])
+        following.positionChanged.emit(80)
+        self.assertEqual(following.state, following.PlaybackState.PausedState)
+        self.assertEqual(following.position(), 0)
+        source_calls = [c for c in following.calls if c[0] == "source"]
+        self.audio.retire()
+        self.audio.prepare("C:/fixture/following.wav", "next-clip")
+        self.assertIs(self.audio._player, following)
+        self.assertEqual(self.prepared[-1], dict(token="next-clip"))
+        self.assertEqual([c for c in following.calls if c[0] == "source"], source_calls)
+        self.audio.align(0, 1.5, False, force=True)
+        following.output.setMuted.assert_called_with(False)
+        self.media.errorOccurred.emit()
+        self.media.mediaStatusChanged.emit(self.media.MediaStatus.EndOfMedia)
+        self.assertEqual(self.failed, [])
+
+    def test_repeated_text_can_have_its_own_silent_following_player(self):
+        self.prepare_with(self.media)
+        following = PitchMediaPlayer()
+        factory = type("RepeatedMediaPlayer", (PitchMediaPlayer,),
+                       {"__new__": lambda _cls, *_args, **_kwargs: following})
+        with patch.object(QtMultimedia, "QMediaPlayer", factory), \
+                patch.object(QtMultimedia.QMediaDevices, "audioOutputs", return_value=[object()]), \
+                patch.object(QtMultimedia, "QAudioOutput"):
+            self.audio.preload("C:/fixture/english.wav")
+        self.assertIs(self.audio._next_player, following)
+        self.assertIsNot(self.audio._next_player, self.audio._player)
+        self.audio.stop()
+        self.assertIsNone(self.audio._next_player)
+        self.assertIn(("stop",), following.calls)
 
     def test_single_large_clock_spike_recovers_without_seeking(self):
         self.attach()

@@ -54,7 +54,7 @@ class FakePlayer(QObject):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.loads, self.alignments, self.finishes = [], [], []
+        self.loads, self.alignments, self.finishes, self.preloads = [], [], [], []
         self.pauses = self.stops = 0
         self.auto_load = True
         self.remaining = None
@@ -64,6 +64,9 @@ class FakePlayer(QObject):
         self.loads.append((path, token))
         if self.auto_load:
             self.prepared.emit(dict(token=token))
+
+    def preload(self, path):
+        self.preloads.append(path)
 
     def align(self, position_ms, rate, paused, *, force=False):
         self.alignments.append((position_ms, rate, paused, force))
@@ -363,6 +366,58 @@ class DubbingSessionTests(unittest.TestCase):
         self.assertGreater(speed, initial_speed)
         self.assertLessEqual(7.8 / speed, 2.2)
         self.assertEqual(self.video["rate"], 1)
+
+    def test_position_notifications_do_not_repeatedly_accelerate_the_sentence(self):
+        self.start(duration=8)
+        self.session.audio.reported_position = .2
+        self.now = .2
+        self.tick(position=2.2)
+        stable_speed = self.session.audio.alignments[-1][1]
+        # A coarse Qt position notification remains stale across many ticks.
+        # It must not turn into an ever-increasing rate near the subtitle end.
+        for index in range(1, 20):
+            self.now = .2 + index * .12
+            self.tick(position=2 + self.now)
+            self.assertAlmostEqual(self.session.audio.alignments[-1][1], stable_speed)
+            self.assertFalse(self.session.audio.alignments[-1][3])
+
+    def test_each_web_speed_gets_a_complete_sentence_window(self):
+        for rate in (.5, .75, 1, 1.5):
+            with self.subTest(rate=rate):
+                self.session.stop()
+                self.session.set_enabled(True)
+                self.tick(position=1, rate=rate)
+                if speech_token(CUE["translation"]) not in self.session._cache:
+                    self.session.speech.complete(duration=6)
+                for _ in range(3):
+                    self.tick(position=1, rate=rate)
+                offset, speed, paused, force = self.session.audio.alignments[-1]
+                self.assertEqual((offset, paused), (0, False))
+                available = (CUE["end"] - CUE["start"]) / rate
+                self.assertLessEqual(6 / speed, available - min(.2, available * .1) + .001)
+                self.assertEqual(self.video["rate"], rate)
+
+    def test_slowing_web_video_reduces_voice_speed_without_restarting_words(self):
+        self.start(duration=8)
+        self.session.audio.reported_position = .4
+        self.now = .2
+        self.tick(position=2.2)
+        fast = self.session.audio.alignments[-1][1]
+        self.tick(position=2.2, rate=.5)
+        offset, slower, paused, force = self.session.audio.alignments[-1]
+        self.assertEqual((offset, paused, force), (400, False, False))
+        self.assertLess(slower, fast)
+        self.assertLessEqual(7.6 / slower, (5 - 2.2) / .5 - .2 + .001)
+
+    def test_following_sentence_is_preloaded_even_after_current_audio_ended(self):
+        second = dict(CUE, start=5, end=9, translation="The following sentence")
+        self.session.set_cues(1, [CUE, second])
+        self.start(duration=2)
+        self.session.audio.ended.emit(dict(token=self.session._media_token))
+        self.session.speech.complete(index=1, duration=3)
+        self.tick(position=2.1)
+        self.assertEqual(self.session.audio.preloads[-1], "C:/fixture/english.wav")
+        self.assertEqual(len(self.session.audio.loads), 1)
 
     def test_pause_and_resume_preserve_the_actual_spoken_position(self):
         self.start(duration=8)

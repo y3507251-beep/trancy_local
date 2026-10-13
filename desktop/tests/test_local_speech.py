@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 from pathlib import Path
 import sys
@@ -9,11 +10,69 @@ import time
 import unittest
 import uuid
 import wave
+from array import array
 
 from PyQt6.QtCore import QCoreApplication
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from trancy_desktop.speech import LocalSpeech, speech_cache_key, wave_info
+from trancy_desktop.speech import LocalSpeech, playback_wave, speech_cache_key, wave_info
+
+
+class PlaybackWaveTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(__file__).resolve().parents[1] / "data" / "validation" / "dubbing" / ("padding-" + uuid.uuid4().hex)
+        self.root.mkdir(parents=True)
+
+    def write_wave(self, values):
+        source = self.root / "original.wav"
+        with wave.open(str(source), "wb") as audio:
+            audio.setnchannels(1)
+            audio.setsampwidth(2)
+            audio.setframerate(10000)
+            audio.writeframes(array("h", values).tobytes())
+        return source
+
+    def test_only_outer_padding_is_removed_and_inner_pause_and_source_survive(self):
+        data = [0] * 2000 + [1000] * 3000 + [0] * 1500 + [-1000] * 3000 + [0] * 7000
+        source = self.write_wave(data)
+        original_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+        prepared = playback_wave(source)
+        self.assertAlmostEqual(prepared["duration"], .95)
+        self.assertAlmostEqual(prepared["raw_duration"], 1.65)
+        with wave.open(prepared["path"], "rb") as audio:
+            kept = array("h")
+            kept.frombytes(audio.readframes(audio.getnframes()))
+        self.assertEqual(list(kept), data[1200:10700])
+        self.assertEqual(hashlib.sha256(source.read_bytes()).hexdigest(), original_hash)
+        self.assertEqual(playback_wave(source)["path"], prepared["path"])
+
+    def test_silence_or_already_tight_sentence_is_retained(self):
+        source = self.write_wave([0] * 2000)
+        self.assertEqual(playback_wave(source)["path"], str(source.resolve()))
+        source = self.write_wave([1000] * 2000)
+        self.assertEqual(playback_wave(source)["path"], str(source.resolve()))
+
+    def test_soft_edges_are_preserved_by_padding(self):
+        data = [0] * 2000 + [15] * 500 + [1000] * 2000 + [15] * 500 + [0] * 7000
+        source = self.write_wave(data)
+        prepared = playback_wave(source)
+        with wave.open(prepared["path"], "rb") as audio:
+            kept = array("h")
+            kept.frombytes(audio.readframes(audio.getnframes()))
+        self.assertEqual(list(kept).count(15), 1000)
+
+    def test_damaged_playback_copy_is_rebuilt_without_rerendering_or_deleting(self):
+        source = self.write_wave([0] * 2000 + [1000] * 3000 + [0] * 7000)
+        prepared = playback_wave(source)
+        target = Path(prepared["path"])
+        target.write_bytes(b"damaged playback copy")
+        repaired = playback_wave(source)
+        self.assertEqual(repaired["path"], prepared["path"])
+        self.assertEqual(repaired["duration"], prepared["duration"])
+        retained = list(target.parent.glob("invalid-*.wav"))
+        self.assertEqual(len(retained), 1)
+        self.assertEqual(retained[0].read_bytes(), b"damaged playback copy")
+        self.assertTrue(source.is_file())
 
 
 def spin_until(predicate, timeout=5):

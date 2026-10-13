@@ -8,6 +8,7 @@ of the text, requested voice and synthesis rate; no speech file is deleted.
 from __future__ import annotations
 
 from collections import deque
+from array import array
 import hashlib
 import json
 import math
@@ -15,6 +16,7 @@ import os
 from pathlib import Path
 import queue
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -182,6 +184,46 @@ def wave_info(path: str | Path) -> dict:
                     channels=audio.getnchannels(), samples=audio.getnframes())
 
 
+def playback_wave(path: str | Path) -> dict:
+    """Remove only near-silent outer padding, retaining the original cache WAV.
+
+    SAPI adds a long silent tail. Fitting that tail into a short subtitle makes
+    the spoken sentence unnecessarily fast. Inner pauses remain byte-for-byte
+    intact; quiet consonants retain 80 ms before and 120 ms after their edges.
+    """
+    path = Path(path)
+    original = wave_info(path)
+    stat = path.stat()
+    target = path.parent / "playback-v1" / f"{path.stem}-{stat.st_size:x}-{stat.st_mtime_ns:x}.wav"
+    if target.is_file():
+        try:
+            return dict(path=str(target.resolve()), raw_duration=original["duration"], **wave_info(target))
+        except (OSError, ValueError, EOFError, wave.Error, ZeroDivisionError):
+            target.rename(target.with_name("invalid-" + uuid.uuid4().hex + ".wav"))
+    with wave.open(str(path), "rb") as source:
+        params = source.getparams()
+        data = source.readframes(source.getnframes())
+    samples = array("h")
+    samples.frombytes(data)
+    if sys.byteorder != "little":
+        samples.byteswap()
+    first = next((i for i, value in enumerate(samples) if abs(value) > 32), None)
+    if first is None:
+        return dict(path=str(path.resolve()), raw_duration=original["duration"], **original)
+    last = len(samples) - 1 - next(i for i, value in enumerate(reversed(samples)) if abs(value) > 32)
+    channels, rate = original["channels"], original["sample_rate"]
+    start = max(0, first // channels - round(rate * .08))
+    end = min(original["samples"], last // channels + 1 + round(rate * .12))
+    if original["samples"] - (end - start) < rate * .1:
+        return dict(path=str(path.resolve()), raw_duration=original["duration"], **original)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    # Derived playback files never replace or delete the synthesized source.
+    with wave.open(str(target), "wb") as output:
+        output.setparams(params)
+        output.writeframes(data[start * channels * 2:end * channels * 2])
+    return dict(path=str(target.resolve()), raw_duration=original["duration"], **wave_info(target))
+
+
 class LocalSpeech(QObject):
     ready = pyqtSignal(dict)
     failed = pyqtSignal(dict)
@@ -324,7 +366,7 @@ class LocalSpeech(QObject):
     def _cached(self, task) -> dict | None:
         path = self.cache_dir / (task["key"] + ".wav")
         try:
-            info = wave_info(path)
+            info = playback_wave(path)
             voice = task["voice"]
             try:
                 metadata = json.loads(path.with_suffix(".json").read_text(encoding="utf-8"))
@@ -332,7 +374,7 @@ class LocalSpeech(QObject):
                     voice = metadata["voice"]
             except (OSError, ValueError):
                 pass
-            return dict(path=str(path.resolve()), voice=voice, **info)
+            return dict(voice=voice, **info)
         except (OSError, ValueError, EOFError, wave.Error, ZeroDivisionError):
             return None
 
@@ -413,9 +455,14 @@ class LocalSpeech(QObject):
         except OSError:
             self._fail_active("cache_error")
             return
+        try:
+            playback = playback_wave(final)
+        except (OSError, ValueError, EOFError, wave.Error, ZeroDivisionError):
+            self._fail_active("cache_error")
+            return
         self._active = None
         self._deadline.stop()
-        self._emit_ready(task, path=str(final), voice=voice, **info, cached=False,
+        self._emit_ready(task, voice=voice, **playback, cached=False,
                          render_ms=event.get("render_ms", 0))
         self._schedule_drive()
 

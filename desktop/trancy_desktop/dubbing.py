@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from bisect import bisect_right
 import hashlib
+import logging
 import math
 import time
 import uuid
@@ -11,6 +12,9 @@ from PyQt6.QtCore import QObject, QTimer, QUrl, pyqtSignal
 
 from .timeline import Timeline, browser_identity, cue_key
 from .translation import detect_target
+
+
+LOG = logging.getLogger(__name__)
 
 
 def english_text(cue):
@@ -49,13 +53,36 @@ class QtSpeechPlayer(QObject):
         self._aligned = False
         self._drift_since = None
         self._last_seek = -math.inf
+        self._path = None
+        self._next_player = None
+        self._next_path = None
+        self._next_ready = False
+        self._next_warming = False
 
     def prepare(self, path, token):
+        self.retire()
+        self._token, self._path = token, str(path)
+        if self._next_player is not None and self._next_path == str(path):
+            player, ready = self._next_player, self._next_ready
+            self._next_player = self._next_path = None
+            self._next_ready = self._next_warming = False
+            player.pause()
+            player.setPosition(0)
+            self._player, self._prepared = player, ready
+            if ready:
+                self.prepared.emit(dict(token=token))
+            return
+        player = self._create_player(token)
+        if player is None:
+            return
+        self._player, self._prepared = player, False
+        player.setSource(QUrl.fromLocalFile(str(path)))
+
+    def _create_player(self, token):
         from PyQt6.QtMultimedia import QAudioOutput, QMediaDevices, QMediaPlayer
-        self.stop()
         if not QMediaDevices.audioOutputs():
             self.failed.emit(dict(token=token, message="未找到可用的声音输出设备"))
-            return
+            return None
         player = QMediaPlayer(self)
         # Qt 6.8 changes pitch along with playback speed. Long English
         # translations must use the time stretcher, not that resampling path.
@@ -65,24 +92,51 @@ class QtSpeechPlayer(QObject):
             player.deleteLater()
             self.failed.emit(dict(token=token, code="pitch_unavailable",
                                   message="英文配音需要支持保留音高的 Qt 6.10 或更新环境"))
-            return
+            return None
         player.setPitchCompensation(True)
         if not player.pitchCompensation():
             player.deleteLater()
             self.failed.emit(dict(token=token, code="pitch_unavailable",
                                   message="当前音频播放器无法启用保留音高，请更新桌面环境"))
-            return
+            return None
         output = QAudioOutput(player)
+        output.setMuted(True)
         player.setAudioOutput(output)
-        self._player, self._token, self._prepared = player, token, False
         player.mediaStatusChanged.connect(lambda status, p=player: self._media_status(p, status))
         player.errorOccurred.connect(lambda *_args, p=player: self._failed(p))
+        player.positionChanged.connect(lambda position, p=player: self._warm_position(p, position))
+        return player
+
+    def preload(self, path):
+        """Warm one following sentence silently, without replacing live audio."""
+        if str(path) == self._next_path:
+            return
+        self._drop_preload()
+        player = self._create_player(None)
+        if player is None:
+            return
+        self._next_player, self._next_path = player, str(path)
+        self._next_ready = self._next_warming = False
         player.setSource(QUrl.fromLocalFile(str(path)))
 
+    def _warm_position(self, player, position):
+        if player is self._next_player and self._next_warming and position > 0:
+            self._next_warming = False
+            player.pause()
+            player.setPosition(0)
+
     def _media_status(self, player, status):
+        from PyQt6.QtMultimedia import QMediaPlayer
+        if player is self._next_player:
+            if status in (QMediaPlayer.MediaStatus.LoadedMedia, QMediaPlayer.MediaStatus.BufferedMedia):
+                if not self._next_ready:
+                    self._next_ready = self._next_warming = True
+                    player.play()  # QAudioOutput remains muted throughout warm-up.
+            elif status == QMediaPlayer.MediaStatus.InvalidMedia:
+                self._drop_preload()
+            return
         if player is not self._player:
             return
-        from PyQt6.QtMultimedia import QMediaPlayer
         if status in (QMediaPlayer.MediaStatus.LoadedMedia, QMediaPlayer.MediaStatus.BufferedMedia):
             if not self._prepared:
                 self._prepared = True
@@ -93,6 +147,9 @@ class QtSpeechPlayer(QObject):
             self.ended.emit(dict(token=self._token))
 
     def _failed(self, player):
+        if player is self._next_player:
+            self._drop_preload()
+            return
         if player is self._player:
             self.failed.emit(dict(token=self._token, message="本地英文配音播放失败"))
 
@@ -124,6 +181,7 @@ class QtSpeechPlayer(QObject):
             if player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
                 player.pause()
         elif player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
+            player.audioOutput().setMuted(False)
             player.play()
 
     def pause(self):
@@ -167,15 +225,29 @@ class QtSpeechPlayer(QObject):
         elif player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
             player.play()
 
-    def stop(self):
+    def retire(self):
+        """Retire the current sentence while keeping its silent successor ready."""
         player, self._player = self._player, None
         self._token, self._prepared = None, False
+        self._path = None
         self._aligned = False
         self._drift_since = None
         self._last_seek = -math.inf
         if player is not None:
             player.stop()
             player.deleteLater()
+
+    def _drop_preload(self):
+        player, self._next_player = self._next_player, None
+        self._next_path = None
+        self._next_ready = self._next_warming = False
+        if player is not None:
+            player.stop()
+            player.deleteLater()
+
+    def stop(self):
+        self.retire()
+        self._drop_preload()
 
 
 class DubbingSession(QObject):
@@ -227,6 +299,9 @@ class DubbingSession(QObject):
         self._clip_started = False
         self._clip_stretch = 1.
         self._clip_seek_position = None
+        self._clip_rate = None
+        self._clip_paused = False
+        self._clip_output_started = False
         self._clip_video_origin = self._clip_audio_origin = 0.
         self._tail_deadline = None
         self._frame = None
@@ -301,14 +376,20 @@ class DubbingSession(QObject):
         self._seek_serial = None
         self._reset_speech()
 
-    def _stop_clip(self):
-        self.audio.stop()
+    def _stop_clip(self, *, preserve_preload=False):
+        if preserve_preload and hasattr(self.audio, "retire"):
+            self.audio.retire()
+        else:
+            self.audio.stop()
         self._clip = self._clip_token = self._clip_cue = None
         self._media_token = self._loading_token = None
         self._media_ready = self._ended = False
         self._clip_started = False
         self._clip_stretch = 1.
         self._clip_seek_position = None
+        self._clip_rate = None
+        self._clip_paused = False
+        self._clip_output_started = False
         self._clip_video_origin = self._clip_audio_origin = 0.
         self._tail_deadline = None
 
@@ -393,7 +474,7 @@ class DubbingSession(QObject):
         text = english_text(cue) if cue else ""
         token = speech_token(text) if text else None
         if (key, token) != (self._clip, self._clip_token):
-            self._stop_clip()
+            self._stop_clip(preserve_preload=True)
             self._clip, self._clip_token = key, token
             self._clip_cue = dict(cue) if cue else None
             self._clip_seek_position = position if jumped else None
@@ -418,6 +499,7 @@ class DubbingSession(QObject):
         if self._ended:
             if self._active:
                 self._renew()
+            self._preload_following(position)
             return
         if not self._media_ready:
             if getattr(self, "_loading_token", None) != (key, token):
@@ -446,14 +528,31 @@ class DubbingSession(QObject):
             audio_seconds = (reported if reported is not None and math.isfinite(reported) else
                              self._clip_audio_origin + max(0., position - self._clip_video_origin) * self._clip_stretch)
             audio_seconds = max(0., min(sample["duration"], audio_seconds))
-        remaining_video = max(.001, self._voice_end(cue) - position)
-        reserve = min(self.FIT_MARGIN_SECONDS * rate, remaining_video * .1)
-        needed = (sample["duration"] - audio_seconds) / max(.001, remaining_video - reserve)
-        # Reserve output latency before the next subtitle. Keep an already
-        # selected speed stable, increasing it only when actual playback lags.
-        stretch = max(1., self._clip_stretch, needed)
-        self._clip_stretch = stretch
-        playback_rate = max(.25, rate * stretch)
+        output_started = self._clip_started and not self._clip_output_started and audio_seconds > .02
+        rate_changed = self._clip_rate is not None and abs(rate - self._clip_rate) > .001
+        resumed = self._clip_started and self._clip_paused and not paused
+        if not self._clip_started or rate_changed or resumed or output_started:
+            # Choose an average rate for the whole remaining sentence. Normal
+            # position notifications never chase the deadline by repeatedly
+            # rebuilding Qt's pitch-compensating time stretcher.
+            available = max(.001, (self._voice_end(cue) - position) / rate)
+            reserve = min(self.FIT_MARGIN_SECONDS, available * .1)
+            needed = max(0., sample["duration"] - audio_seconds) / max(.001, available - reserve)
+            playback_rate = max(.25, rate, needed)
+            if output_started and not rate_changed and not resumed:
+                previous_rate = rate * self._clip_stretch
+                if playback_rate <= previous_rate * 1.05:
+                    playback_rate = previous_rate
+            self._clip_stretch = playback_rate / rate
+            LOG.info("dubbing_fit window=%.3f speech=%.3f video_rate=%.3f speech_rate=%.3f reason=%s",
+                     available, sample["duration"] - audio_seconds, rate, playback_rate,
+                     "start" if not self._clip_started else "rate" if rate_changed else
+                     "resume" if resumed else "audio_started")
+        else:
+            playback_rate = max(.25, rate * self._clip_stretch)
+        if output_started:
+            self._clip_output_started = True
+        self._clip_rate, self._clip_paused = rate, paused
         self._clip_video_origin, self._clip_audio_origin = position, audio_seconds
         if audio_seconds >= sample["duration"]:
             self.audio.finish(playback_rate, paused)
@@ -465,7 +564,20 @@ class DubbingSession(QObject):
             return
         if not paused and self._media_ready and self._active:
             self._clip_started = True
+        self._preload_following(position)
         self._status("英文配音已暂停" if paused else "英文配音播放中 · 跟随 B 站播放进度")
+
+    def _preload_following(self, position):
+        if not self.enabled or not self._media_ready or not hasattr(self.audio, "preload"):
+            return
+        index = bisect_right(self._timeline._starts, position)
+        for cue in self._timeline.cues[index:index + self.PREFETCH]:
+            text = english_text(cue)
+            if text:
+                sample = self._cache.get(speech_token(text))
+                if sample:
+                    self.audio.preload(sample["path"])
+                return
 
     def _finish_tail(self, position, paused, rate, *, natural_end=False):
         cue = self._clip_cue
