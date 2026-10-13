@@ -27,7 +27,6 @@ DEFAULTS = {
     "overlay_locked": False,
     "follow_potplayer": True,
     "follow_browser": False,
-    "dubbing_voice": "af_heart",
 }
 
 

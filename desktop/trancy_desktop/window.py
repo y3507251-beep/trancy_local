@@ -69,7 +69,7 @@ class MainWindow(QMainWindow):
         icon = ROOT.parent / "assets/icons/ic128.png"
         if icon.exists():
             self.setWindowIcon(QIcon(str(icon)))
-        self.resize(1040, 900)
+        self.resize(1040, 810)
         self.setMinimumSize(920, 720)
         self.setStyleSheet(STYLE)
         self.timeline = Timeline()
@@ -111,7 +111,6 @@ class MainWindow(QMainWindow):
         self._temp_recycling = 0
         self._last_error = ""
         self._build_ui()
-        self.setMinimumHeight(max(self.minimumHeight(), self.minimumSizeHint().height()))
         self.overlay = SubtitleOverlay(self.settings)
         self.overlay.moved.connect(lambda x, y: self.settings.update(overlay_x=x, overlay_y=y))
         self.overlay.set_locked(bool(self.settings.get("overlay_locked")))
@@ -243,27 +242,13 @@ class MainWindow(QMainWindow):
         web_layout.addWidget(self._button("生成所选网页视频双语字幕", self.start_browser, True))
         self.tabs.addTab(web, "B 站 / YouTube")
         self.tabs.setCurrentWidget(web)
-        from .kokoro_speech import KOKORO_VOICES
-        voice_row = QHBoxLayout()
-        voice_row.addWidget(QLabel("配音音色"))
-        self.dubbing_voice = QComboBox()
-        for title, voice in KOKORO_VOICES:
-            self.dubbing_voice.addItem(title, voice)
-        self.dubbing_voice.setCurrentIndex(max(0, self.dubbing_voice.findData(self.settings.get("dubbing_voice"))))
-        voice_row.addWidget(self.dubbing_voice, 1)
-        web_layout.addLayout(voice_row)
-        self.dubbing_voice.currentIndexChanged.connect(self._dubbing_voice_changed)
-        self.english_dubbing = QCheckBox("启用英文配音（B 站 · Kokoro 本地语音）")
+        self.english_dubbing = QCheckBox("启用英文配音（B 站 · 本地语音）")
         self.english_dubbing.setChecked(False)
         self.dubbing_status = QLabel("英文配音已关闭 · 播放原声")
         self.dubbing_status.setWordWrap(True)
         web_layout.addWidget(self.english_dubbing)
         web_layout.addWidget(self.dubbing_status)
         self.english_dubbing.toggled.connect(self._dubbing_toggled)
-        # Keep video selection, generate button and both voice choices readable
-        # when the caption history competes for vertical space.
-        web.setMinimumHeight(web.sizeHint().height())
-        self.tabs.setMinimumHeight(web.minimumHeight() + self.tabs.tabBar().sizeHint().height() + 4)
 
         controls = QHBoxLayout()
         controls.addWidget(self._button("停止当前任务", self.stop))
@@ -349,7 +334,7 @@ class MainWindow(QMainWindow):
         if enabled and self._dubbing is None:
             try:
                 from .dubbing import DubbingSession
-                self._dubbing = DubbingSession(self.bridge, self, voice=self.dubbing_voice.currentData())
+                self._dubbing = DubbingSession(self.bridge, self)
                 self._dubbing.status.connect(self.dubbing_status.setText)
                 self._dubbing.disabled.connect(self._dubbing_disabled)
                 self._dubbing.closed.connect(self._dubbing_closed)
@@ -367,12 +352,6 @@ class MainWindow(QMainWindow):
     def _dubbing_disabled(self, message):
         self.english_dubbing.setChecked(False)
         self.dubbing_status.setText(message)
-
-    def _dubbing_voice_changed(self):
-        voice = self.dubbing_voice.currentData()
-        self.settings.update(dubbing_voice=voice)
-        if self._dubbing:
-            self._dubbing.set_voice(voice)
 
     def _refresh_dubbing(self):
         if self._dubbing is None or self._closing:

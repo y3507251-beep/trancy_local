@@ -9,7 +9,6 @@ import uuid
 
 from PyQt6.QtCore import QObject, QTimer, QUrl, pyqtSignal
 
-from .kokoro_speech import DEFAULT_KOKORO_VOICE, KOKORO_VOICES
 from .timeline import Timeline, browser_identity, cue_key
 from .translation import detect_target
 
@@ -191,15 +190,11 @@ class DubbingSession(QObject):
     RESTORE_GRACE = 1.8
     TAIL_SECONDS = 1.0
 
-    def __init__(self, bridge, parent=None, *, speech_factory=None, player_factory=None, clock=None,
-                 voice=DEFAULT_KOKORO_VOICE):
+    def __init__(self, bridge, parent=None, *, speech_factory=None, player_factory=None, clock=None):
         super().__init__(parent)
-        if voice not in {value for _, value in KOKORO_VOICES}:
-            raise ValueError("Unknown Kokoro voice")
-        self.voice = voice
         if speech_factory is None:
-            from .kokoro_speech import KokoroSpeech
-            speech_factory = KokoroSpeech
+            from .speech import LocalSpeech
+            speech_factory = LocalSpeech
         self.bridge = bridge
         self.speech = speech_factory(parent=self)
         self.audio = (player_factory or QtSpeechPlayer)(parent=self)
@@ -269,19 +264,6 @@ class DubbingSession(QObject):
         else:
             self._failures.clear()
             self._status("英文配音已开启 · 等待 B 站字幕")
-
-    def set_voice(self, voice):
-        if voice not in {value for _, value in KOKORO_VOICES}:
-            raise ValueError("Unknown Kokoro voice")
-        if self._closing or voice == self.voice:
-            return
-        # Release the current mute lease and retire all old-voice callbacks.
-        # Disk caches retain both voices; session entries belong to one voice.
-        self.stop()
-        self.voice = voice
-        self._cache.clear()
-        self._failures.clear()
-        self._status("音色已切换 · 正在准备英文配音" if self.enabled else "英文配音已关闭 · 播放原声")
 
     def set_source(self, generation, video):
         key = self._source_key(video)
@@ -537,7 +519,7 @@ class DubbingSession(QObject):
             if token in self._cache or token in self._pending or token in self._failures:
                 continue
             self._pending.add(token)
-            if not self.speech.request(text, token, self._epoch, voice=self.voice):
+            if not self.speech.request(text, token, self._epoch):
                 self._pending.discard(token)
 
     def _renew(self):
@@ -601,7 +583,7 @@ class DubbingSession(QObject):
         token = event.get("token")
         self._pending.discard(token)
         self._failures.add(token)
-        if event.get("code") in {"no_english_voice", "voice_unavailable", "engine_unavailable", "kokoro_unavailable"}:
+        if event.get("code") in {"no_english_voice", "voice_unavailable", "engine_unavailable"}:
             self.enabled = False
             self.stop()
             self.disabled.emit(event.get("message") or "本地英文语音不可用 · 播放原声")
