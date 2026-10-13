@@ -23,7 +23,7 @@ class DubbingBridgeTests(unittest.TestCase):
         self.bridge._server = object()  # Dispatch-only: no real HTTP listener.
         self.client = "bilibili-dubbing-test-client"
         self.session = self.bridge._dispatch("/v1/hello", {
-            "client_id": self.client, "connector_version": "0.1.4"}, "")[1]["session"]
+            "client_id": self.client, "connector_version": "0.1.5"}, "")[1]["session"]
         self.post("/v1/video", {"tab_id": 10, "seq": 1, "video": VIDEO})
         self.video = self.bridge.latest()
         self.events = []
@@ -153,6 +153,28 @@ class DubbingBridgeTests(unittest.TestCase):
         self.result(request, position=float("nan"), rate=float("inf"), seek_serial=-2)
         self.assertEqual((self.events[-1]["position"], self.events[-1]["rate"], self.events[-1]["seek_serial"]), (0, 1, 0))
 
+    def test_natural_end_survives_periodic_reports_and_manual_pause_is_distinct(self):
+        for sequence, ended, playback_event in ((2, True, "ended"), (3, True, ""), (4, False, "pause")):
+            self.post("/v1/video", {"tab_id": 10, "seq": sequence,
+                "video": dict(VIDEO, position=120, paused=True, ended=ended, playback_event=playback_event)})
+            current = self.bridge.latest()
+            self.assertTrue(current["paused"])
+            self.assertIs(current["ended"], ended)
+            self.assertEqual(current["playback_event"], playback_event)
+        # Being near the duration, or having only an event string, does not
+        # turn an old connector's manual pause into a natural end.
+        self.assertFalse(normalize_video(dict(VIDEO, position=120, paused=True, playback_event="ended"))["ended"])
+        self.assertFalse(normalize_video(dict(VIDEO, ended="true"))["ended"])
+
+    def test_dubbing_ack_keeps_ended_independent_of_paused_and_rejects_non_boolean_values(self):
+        for ended in (True, False, None, "true", 1):
+            request = self.bridge.set_dubbing(self.video, True, LEASE)
+            fields = {} if ended is None else {"ended": ended}
+            self.assertTrue(self.result(request, paused=True, position=120, **fields)["accepted"])
+            event = self.events[-1]
+            self.assertTrue(event["paused"])
+            self.assertIs(event["ended"], ended is True)
+
 
 PAGE_SETUP = r'''
 const assert=require('node:assert/strict'),fs=require('node:fs'),vm=require('node:vm');
@@ -255,6 +277,20 @@ page.media.paused=false;page.media.readyState=4;page.media.emit('playing');asser
 page.media.playbackRate=1.5;page.media.emit('ratechange');assert.equal(page.videos().at(-1).video.rate,1.5);
 ''')
 
+    def test_natural_end_is_durable_in_reports_and_acks_but_manual_pause_is_not_end(self):
+        self.run_node(r'''
+const page=setup();page.media.currentTime=120;page.media.paused=true;page.media.emit('pause');
+let report=page.videos().at(-1).video;assert.equal(report.paused,true);assert.equal(report.ended,false);
+page.command(true);assert.equal(page.results().at(-1).ended,false);assert.equal(page.results().at(-1).paused,true);
+page.media.ended=true;page.media.emit('ended');report=page.videos().at(-1).video;
+assert.equal(report.ended,true);assert.equal(report.playback_event,'ended');
+page.report();report=page.videos().at(-1).video;assert.equal(report.ended,true);assert.equal(report.playback_event,'');
+page.command(true,'c'.repeat(32));assert.equal(page.results().at(-1).ended,true);assert.equal(page.results().at(-1).paused,true);
+page.media.currentTime=0;page.media.ended=false;page.media.seeking=true;page.media.emit('seeking');
+report=page.videos().at(-1).video;assert.equal(report.ended,false);assert.equal(report.seeking,true);
+page.command(true,'d'.repeat(32));assert.equal(page.results().at(-1).ended,false);assert.equal(page.results().at(-1).seeking,true);
+''')
+
     def test_ad_and_pagehide_restore_without_starting_or_seeking_video(self):
         self.run_node(r'''
 const page=setup();page.command(true);page.ad=true;page.report();assert.equal(page.media.muted,false);
@@ -274,7 +310,7 @@ function setup(){
   setTimeout:fn=>{timer=fn;return 1;},clearTimeout:()=>{},
   fetch:async(url,options)=>{const body=JSON.parse(options.body);posts.push({url,body});if(fail)throw Error('offline');
    return{ok:true,json:async()=>url.endsWith('/hello')?{session:'local-session'}:url.endsWith('/poll')?{jobs:[],caption_jobs:[],dubbing_jobs:queue.splice(0)}:{accepted:true}};},
-  chrome:{runtime:{id:'desktop-extension',getManifest:()=>({name:'Trancy 桌面字幕连接器',version:'0.1.4'}),
+  chrome:{runtime:{id:'desktop-extension',getManifest:()=>({name:'Trancy 桌面字幕连接器',version:'0.1.5'}),
    getPlatformInfo:async()=>({os:'win'}),onMessage:{addListener:fn=>{listener=fn;}}},
    tabs:{sendMessage:async(tabId,message,options)=>{commands.push({tabId,message,options});return{accepted:true};},
     onRemoved:{addListener:()=>{}},onUpdated:{addListener:()=>{}}},alarms:{onAlarm:{addListener:()=>{}},create:()=>{}}}};
@@ -305,6 +341,33 @@ assert.ok(report);assert.equal(report.body.video.paused,true);assert.equal(repor
 assert.equal(report.body.video.buffering,true);assert.equal(report.body.video.dubbing_protocol,1);assert.equal(report.body.tab_id,10);
 ''')
 
+    def test_end_state_survives_immediate_and_periodic_uploads_and_clears_on_manual_pause(self):
+        self.run_node(r'''
+const bridge=setup();await flush();let sequence=0;
+for(const [ended,event] of [[true,'ended'],[true,''],[false,'pause'],['true','pause'],[undefined,'pause']]){
+ bridge.emit({kind:'trancy-desktop-report-v1',href:bridge.video.url,document_start:100,sequence:++sequence,
+  video:{...bridge.video,position:120,paused:true,ended,playback_event:event}});
+ await bridge.tick();const report=bridge.posts.filter(p=>p.url.endsWith('/video')).at(-1);
+ assert.ok(report);assert.equal(report.body.video.ended,ended===true);assert.equal(report.body.video.paused,true);
+ assert.equal(report.body.video.playback_event,event);
+}
+''')
+
+    def test_dubbing_ack_forwards_strict_end_state_without_losing_pause_or_seek(self):
+        self.run_node(r'''
+const bridge=setup();await flush();bridge.emit({kind:'trancy-desktop-report-v1',href:bridge.video.url,document_start:100,sequence:1,video:bridge.video});
+let sequence=1;
+for(const ended of [true,false,'true',undefined]){
+ const job={id:String(++sequence).repeat(32),lease_id:'b'.repeat(32),tab_id:10,document_start:100,video:bridge.video,enabled:true};
+ bridge.queue.push(job);await bridge.tick();bridge.emit({kind:'trancy-desktop-dubbing-report-v1',href:bridge.video.url,
+  document_start:100,sequence,request_id:job.id,lease_id:job.lease_id,video:bridge.video,status:'active',
+  position:120,paused:true,ended,seeking:true,seek_serial:2});await flush();
+ const ack=bridge.posts.filter(p=>p.url.endsWith('/dubbing')).at(-1);
+ assert.ok(ack);assert.equal(ack.body.ended,ended===true);assert.equal(ack.body.paused,true);
+ assert.equal(ack.body.seeking,true);assert.equal(ack.body.seek_serial,2);
+}
+''')
+
     def test_selected_tab_control_ack_and_disconnect_release(self):
         self.run_node(r'''
 const bridge=setup();await flush();bridge.emit({kind:'trancy-desktop-report-v1',href:bridge.video.url,document_start:100,sequence:1,video:bridge.video});
@@ -332,6 +395,36 @@ for(const badVideo of [{dubbing_protocol:0},{cid:'99999'}]){
 
 @unittest.skipUnless(shutil.which("node"), "Node.js is required for the extension sandbox")
 class DubbingContentTests(unittest.TestCase):
+    def test_content_relay_preserves_end_in_periodic_video_reports_and_dubbing_ack(self):
+        script = r'''
+const assert=require('node:assert/strict'),fs=require('node:fs'),vm=require('node:vm');
+let runtimeListener,windowListener;const sent=[];
+const ctx={performance:{timeOrigin:100},location:new URL('https://www.bilibili.com/video/BV1xx411c7mD/?p=2'),setTimeout:()=>{},
+ chrome:{runtime:{id:'desktop-extension',onMessage:{addListener:fn=>{runtimeListener=fn;}},sendMessage:async m=>{sent.push(m);}}},
+ addEventListener:(_,fn)=>{windowListener=fn;},postMessage:()=>{}};
+ctx.window=ctx;ctx.top=ctx;vm.createContext(ctx);vm.runInContext(fs.readFileSync('assets/desktop-bridge-content.js','utf8'),ctx);
+ctx.__windowListener=windowListener;vm.runInContext(`__deliver=m=>__windowListener({source:window,origin:location.origin,data:m});`,ctx);
+const video={platform:'bilibili',video_id:'BV1xx411c7mD',url:ctx.location.href,page:2,cid:'12345'};let sequence=0;
+for(const ended of [true,false,'true',undefined]){
+ const command={kind:'trancy-desktop-dubbing-request-v1',request_id:String(++sequence).repeat(32),
+  lease_id:'b'.repeat(32),video,document_start:100,enabled:true};
+ runtimeListener(command,{id:'desktop-extension'},()=>{});
+ ctx.__deliver({kind:'trancy-desktop-dubbing-v1',href:ctx.location.href,sequence,document_start:100,request_id:command.request_id,
+  lease_id:command.lease_id,video,status:'active',position:120,paused:true,ended,rate:1,seeking:true,seek_serial:2});
+ const ack=sent.at(-1);assert.equal(ack.kind,'trancy-desktop-dubbing-report-v1');
+ assert.equal(ack.ended,ended===true);assert.equal(ack.paused,true);assert.equal(ack.seeking,true);assert.equal(ack.seek_serial,2);
+}
+for(const [ended,playback_event] of [[true,'ended'],[true,''],[false,'pause']]){
+ ctx.__deliver({kind:'trancy-desktop-video-v1',href:ctx.location.href,sequence:++sequence,document_start:100,
+  video:{...video,position:120,paused:true,ended,playback_event}});
+ const report=sent.at(-1);assert.equal(report.kind,'trancy-desktop-report-v1');
+ assert.equal(report.video.ended,ended);assert.equal(report.video.paused,true);assert.equal(report.video.playback_event,playback_event);
+}
+'''
+        result = subprocess.run([shutil.which("node"), "-e", script], cwd=Path(__file__).resolve().parents[2],
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_only_authorized_lease_can_relay_active_and_unsolicited_terminal_status(self):
         script = r'''
 const assert=require('node:assert/strict'),fs=require('node:fs'),vm=require('node:vm');

@@ -5,8 +5,11 @@ from enum import Enum
 import os
 from pathlib import Path
 import sys
+import time
 import unittest
 from unittest.mock import patch
+import uuid
+import wave
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -45,6 +48,8 @@ class LegacyMediaPlayer:
         self.mediaStatusChanged, self.errorOccurred = Signal(), Signal()
         self.calls = []
         self.current_position, self.current_rate = 0, 1.
+        self.current_duration = 4000
+        self.current_status = self.MediaStatus.LoadedMedia
         self.state = self.PlaybackState.StoppedState
         self.output = None
 
@@ -54,6 +59,12 @@ class LegacyMediaPlayer:
     def setPosition(self, position):
         self.calls.append(("seek", position))
         self.current_position = position
+
+    def duration(self):
+        return self.current_duration
+
+    def mediaStatus(self):
+        return self.current_status
 
     def playbackRate(self):
         return self.current_rate
@@ -293,6 +304,58 @@ class QtSpeechPlayerTests(unittest.TestCase):
         self.audio.align(1000, 2, False, force=True)
         self.assertEqual(self.media.calls, [])
 
+    def test_remaining_seconds_uses_actual_player_position_and_speed(self):
+        self.attach()
+        self.media.current_position = 3000
+        self.media.current_rate = 2
+        self.assertEqual(self.audio.remaining_seconds(), .5)
+        self.media.current_position = 4100
+        self.assertEqual(self.audio.remaining_seconds(), 0)
+
+    def test_unknown_or_unprepared_media_has_no_remaining_time_estimate(self):
+        self.assertIsNone(self.audio.remaining_seconds())
+        self.audio._player = self.media
+        self.assertIsNone(self.audio.remaining_seconds())
+        self.audio._prepared = True
+        self.media.current_duration = 0
+        self.assertIsNone(self.audio.remaining_seconds())
+
+    def test_finish_drains_current_clip_without_seeking_to_its_predicted_eof(self):
+        self.attach()
+        self.audio.align(3800, 1, False)
+        calls = list(self.media.calls)
+        self.audio.finish(1, False)
+        self.assertEqual(self.media.calls, calls)
+        self.assertEqual(self.media.position(), 3800)
+        self.assertEqual(self.media.state, self.media.PlaybackState.PlayingState)
+
+    def test_finish_honors_rate_pause_and_resume_without_seeking(self):
+        self.attach()
+        self.audio.align(3800, 1, False)
+        self.audio.finish(1.5, True)
+        self.assertEqual(self.media.state, self.media.PlaybackState.PausedState)
+        self.assertEqual(self.media.current_rate, 1.5)
+        self.audio.finish(1.5, False)
+        self.assertEqual(self.media.state, self.media.PlaybackState.PlayingState)
+        self.assertEqual(self.seeks(), [3800])
+
+    def test_finish_after_end_of_media_cannot_restart_change_rate_or_seek(self):
+        self.attach()
+        ended = []
+        self.audio.ended.connect(ended.append)
+        self.media.current_status = self.media.MediaStatus.EndOfMedia
+        self.media.state = self.media.PlaybackState.StoppedState
+        self.audio._media_status(self.media, self.media.current_status)
+        self.assertEqual(ended, [dict(token="clip")])
+        self.audio.finish(1.5, False)
+        self.audio.finish(1, True)
+        self.assertEqual(self.media.calls, [])
+
+    def test_unprepared_media_cannot_begin_playing_via_finish(self):
+        self.audio._player = self.media
+        self.audio.finish(1.5, False)
+        self.assertEqual(self.media.calls, [])
+
 
 class RealPitchApiTests(unittest.TestCase):
     def test_installed_player_can_enable_pitch_without_loading_or_playing_audio(self):
@@ -311,6 +374,59 @@ class RealPitchApiTests(unittest.TestCase):
         finally:
             media.stop()
             media.deleteLater()
+            QCoreApplication.processEvents()
+
+    def test_real_end_of_media_is_not_replayed_by_finish(self):
+        if not hasattr(REAL_PLAYER, "PitchCompensationAvailability"):
+            self.skipTest("This environment predates Qt 6.10")
+        if not QtMultimedia.QMediaDevices.audioOutputs():
+            self.skipTest("No local sound output is available")
+        root = Path(__file__).resolve().parents[1] / "data" / "validation" / "dubbing" / ("qt-tail-" + uuid.uuid4().hex)
+        root.mkdir(parents=True)
+        source = root / "silent-tail.wav"
+        # Silent retained PCM fixture plus volume zero: this exercises the
+        # actual backend's EOF while never emitting audible samples.
+        with wave.open(str(source), "wb") as stream:
+            stream.setnchannels(1)
+            stream.setsampwidth(2)
+            stream.setframerate(22050)
+            stream.writeframes(b"\x00\x00" * 4410)
+        audio = QtSpeechPlayer()
+        prepared, ended, failed = [], [], []
+        audio.prepared.connect(prepared.append)
+        audio.ended.connect(ended.append)
+        audio.failed.connect(failed.append)
+        try:
+            audio.prepare(source, "real-tail")
+            deadline = time.monotonic() + 3
+            while not prepared and not failed and time.monotonic() < deadline:
+                QCoreApplication.processEvents()
+                time.sleep(.005)
+            if failed and failed[0].get("code") == "pitch_unavailable":
+                self.skipTest("The selected multimedia backend cannot preserve pitch")
+            self.assertEqual(failed, [])
+            self.assertEqual(prepared, [dict(token="real-tail")])
+            audio._player.audioOutput().setVolume(0)
+            audio.align(0, 1, False)
+            deadline = time.monotonic() + 3
+            while not ended and time.monotonic() < deadline:
+                QCoreApplication.processEvents()
+                time.sleep(.005)
+            self.assertEqual(ended, [dict(token="real-tail")])
+            self.assertEqual(audio._player.mediaStatus(), REAL_PLAYER.MediaStatus.EndOfMedia)
+            self.assertEqual(audio._player.playbackState(), REAL_PLAYER.PlaybackState.StoppedState)
+            audio.finish(1.5, False)
+            deadline = time.monotonic() + .3
+            while time.monotonic() < deadline:
+                QCoreApplication.processEvents()
+                time.sleep(.005)
+            self.assertEqual(ended, [dict(token="real-tail")])
+            self.assertEqual(audio._player.mediaStatus(), REAL_PLAYER.MediaStatus.EndOfMedia)
+            self.assertEqual(audio._player.playbackState(), REAL_PLAYER.PlaybackState.StoppedState)
+            self.assertEqual(audio._player.playbackRate(), 1)
+        finally:
+            audio.stop()
+            audio.deleteLater()
             QCoreApplication.processEvents()
 
 

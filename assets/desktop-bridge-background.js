@@ -55,6 +55,7 @@
     return {platform: raw.platform, video_id: raw.video_id, url: raw.url, page: Number(raw.page) || 1,
       cid, title: String(raw.title || "").slice(0, 600), position: Number(raw.position) || 0,
       duration: Number(raw.duration) || 0, rate: Number(raw.rate) || 1, paused: Boolean(raw.paused),
+      ended: raw.ended === true,
       active: Boolean(sender.tab.active && raw.active), ad_playing: Boolean(raw.ad_playing),
       is_live: Boolean(raw.is_live),
       seeking: Boolean(raw.seeking), buffering: Boolean(raw.buffering),
@@ -148,6 +149,7 @@
       document_start: lease.document_start, lease_id: lease.lease_id, status: message.status,
       reason: dubbingReasons.has(message.reason) ? message.reason : "",
       position: Math.max(0, Math.min(604800, Number(message.position) || 0)), paused: Boolean(message.paused),
+      ended: message.ended === true,
       rate: Math.max(.1, Math.min(16, Number(message.rate) || 1)), seeking: Boolean(message.seeking),
       buffering: Boolean(message.buffering),
       seek_serial: Number.isSafeInteger(message.seek_serial) && message.seek_serial >= 0 ? message.seek_serial : 0}).catch(() => {});

@@ -56,7 +56,8 @@
           document_start: data.document_start, sequence: data.sequence, request_id: data.request_id,
           lease_id: data.lease_id, video: lease.video, status: data.status,
           reason: dubbingReasons.has(data.reason) ? data.reason : "",
-          position: Number(data.position) || 0, paused: Boolean(data.paused), rate: Number(data.rate) || 1,
+          position: Number(data.position) || 0, paused: Boolean(data.paused), ended: data.ended === true,
+          rate: Number(data.rate) || 1,
           seeking: Boolean(data.seeking), buffering: Boolean(data.buffering),
           seek_serial: Number.isSafeInteger(data.seek_serial) && data.seek_serial >= 0 ? data.seek_serial : 0}).catch(() => { alive = false; });
       } catch (_) { alive = false; }

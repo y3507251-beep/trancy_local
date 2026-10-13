@@ -584,7 +584,8 @@
       sequence: ++sequence, href: location.href, request_id: lease.request_id,
       lease_id: lease.lease_id, video: lease.identity, status, reason,
       position: Number.isFinite(video?.currentTime) ? video.currentTime : 0,
-      paused: Boolean(video?.paused || video?.ended), rate: Number(video?.playbackRate) || 1,
+      paused: Boolean(video?.paused || video?.ended), ended: video?.ended === true,
+      rate: Number(video?.playbackRate) || 1,
       seeking: Boolean(video?.seeking), buffering: Boolean(waitingForPlayback || video?.readyState < 3),
       seek_serial: seekSerial}, location.origin);
   }
@@ -703,7 +704,8 @@
         const {video, ...metadata} = found;
         data = {...metadata, position: Number.isFinite(video.currentTime) ? video.currentTime : 0,
           duration: Number.isFinite(video.duration) ? video.duration : 0,
-          paused: video.paused || video.ended || video.readyState < 2, rate: video.playbackRate,
+          paused: video.paused || video.ended || video.readyState < 2, ended: video.ended === true,
+          rate: video.playbackRate,
           seeking: Boolean(video.seeking), buffering: Boolean(waitingForPlayback || video.readyState < 3),
           seek_serial: seekSerial, dubbing_protocol: 1,
           playback_event: playbackEvents.includes(playbackEvent) ? playbackEvent : "",

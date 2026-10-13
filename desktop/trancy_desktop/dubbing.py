@@ -130,6 +130,27 @@ class QtSpeechPlayer(QObject):
         if self._player is not None:
             self._player.pause()
 
+    def remaining_seconds(self):
+        player = self._player
+        if player is None or not self._prepared or player.duration() <= 0:
+            return None
+        return max(0., player.duration() - player.position()) / (1000 * max(.1, player.playbackRate()))
+
+    def finish(self, rate, paused):
+        """Drain already-started audio without seeking to its predicted end."""
+        player = self._player
+        if player is None or not self._prepared:
+            return
+        from PyQt6.QtMultimedia import QMediaPlayer
+        if player.mediaStatus() == QMediaPlayer.MediaStatus.EndOfMedia:
+            return
+        if abs(player.playbackRate() - rate) > .01:
+            player.setPlaybackRate(rate)
+        if paused:
+            player.pause()
+        elif player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
+            player.play()
+
     def stop(self):
         player, self._player = self._player, None
         self._token, self._prepared = None, False
@@ -151,6 +172,7 @@ class DubbingSession(QObject):
     STALE_SECONDS = 2.0
     RENEW_SECONDS = .8
     RESTORE_GRACE = 1.8
+    TAIL_SECONDS = 1.0
 
     def __init__(self, bridge, parent=None, *, speech_factory=None, player_factory=None, clock=None):
         super().__init__(parent)
@@ -185,6 +207,10 @@ class DubbingSession(QObject):
         self._loading_token = None
         self._media_ready = False
         self._ended = False
+        self._clip_cue = None
+        self._clip_started = False
+        self._clip_stretch = 1.
+        self._tail_deadline = None
         self._frame = None
         self._ack_guard = None
         self._seek_serial = None
@@ -252,12 +278,19 @@ class DubbingSession(QObject):
 
     def stop(self):
         self._release()
-        self.audio.stop()
-        self._clip = self._clip_token = self._frame = None
-        self._media_token = self._loading_token = None
-        self._media_ready = self._ended = False
+        self._stop_clip()
+        self._frame = None
         self._seek_serial = None
         self._reset_speech()
+
+    def _stop_clip(self):
+        self.audio.stop()
+        self._clip = self._clip_token = self._clip_cue = None
+        self._media_token = self._loading_token = None
+        self._media_ready = self._ended = False
+        self._clip_started = False
+        self._clip_stretch = 1.
+        self._tail_deadline = None
 
     def _release(self):
         lease, video = self._lease, self._video
@@ -293,7 +326,7 @@ class DubbingSession(QObject):
         if video.get("dubbing_protocol") != 1:
             self._release()
             self.audio.pause()
-            self._status("请重新加载 0.1.4 桌面字幕连接器并刷新 B 站网页")
+            self._status("请重新加载 0.1.5 桌面字幕连接器并刷新 B 站网页")
             return
         position, rate = float(position), float(rate or 1)
         if not math.isfinite(position) or not math.isfinite(rate) or rate <= 0:
@@ -317,14 +350,22 @@ class DubbingSession(QObject):
         self._frame = position, self._clock(), paused, rate
         self._seek_serial = serial
         if jumped:
-            self.audio.stop()
-            self._clip = self._clip_token = None
-            self._media_token = self._loading_token = None
-            self._media_ready = self._ended = False
+            self._stop_clip()
             self._reset_speech()
+        if video.get("ended"):
+            # HTML ended is distinct from a user pressing pause near the end.
+            # Only an already-playing clip can drain; never start a new one.
+            if self._finish_tail(position, paused, rate, natural_end=True):
+                return
+            self._stop_clip()
+            self._release()
+            return
         cue = self._timeline.at(position)
         if cue and position >= self._voice_end(cue):
             cue = None
+        if cue is None and self._finish_tail(position, paused, rate):
+            self._prepare_ahead(None, position)
+            return
         self._prepare_ahead(cue, position)
         if not self.enabled:
             return
@@ -332,10 +373,9 @@ class DubbingSession(QObject):
         text = english_text(cue) if cue else ""
         token = speech_token(text) if text else None
         if (key, token) != (self._clip, self._clip_token):
-            self.audio.stop()
+            self._stop_clip()
             self._clip, self._clip_token = key, token
-            self._media_token = self._loading_token = None
-            self._media_ready = self._ended = False
+            self._clip_cue = dict(cue) if cue else None
         if not cue:
             self.audio.pause()
             if paused and position >= float(video.get("duration") or math.inf) - .1:
@@ -354,15 +394,21 @@ class DubbingSession(QObject):
             self.audio.pause()
             self._status("正在准备本地英文配音 · 当前播放原声")
             return
+        # A missed clip must not begin at EOF. Once playback has started,
+        # only the player's EndOfMedia proves its last samples were consumed.
+        stretch = max(1., min(self.MAX_STRETCH, sample["duration"] / max(.1, self._voice_end(cue) - cue["start"])))
+        audio_seconds = max(0., position - cue["start"]) * stretch
+        if audio_seconds >= sample["duration"] and not self._clip_started:
+            self._ended = True
+        if self._ended:
+            if self._active:
+                self._renew()
+            return
         if not self._media_ready:
             if getattr(self, "_loading_token", None) != (key, token):
                 self._loading_token = key, token
                 self._media_token = uuid.uuid4().hex
                 self.audio.prepare(sample["path"], self._media_token)
-            return
-        if self._ended:
-            if self._active:
-                self._renew()
             return
         if paused and not self._active:
             return
@@ -373,21 +419,47 @@ class DubbingSession(QObject):
         if not self._active or not self._lease or not self.enabled:
             self.audio.pause()
             return
-        # Short speech finishes naturally and leaves silence. Only a long
-        # translation needs acceleration; the player preserves its pitch.
-        stretch = max(1., min(self.MAX_STRETCH, sample["duration"] / max(.1, self._voice_end(cue) - cue["start"])))
-        audio_seconds = max(0., position - cue["start"]) * stretch
+        self._clip_stretch = stretch
+        playback_rate = max(.25, min(4., rate * stretch))
         if audio_seconds >= sample["duration"]:
-            self.audio.pause()
-            self._ended = True
-            return
-        self.audio.align(audio_seconds * 1000, max(.25, min(4., rate * stretch)), paused, force=jumped)
+            self.audio.finish(playback_rate, paused)
+        else:
+            self.audio.align(audio_seconds * 1000, playback_rate, paused, force=jumped)
+        if not paused and self._media_ready and self._active:
+            self._clip_started = True
         self._status("英文配音已暂停" if paused else "英文配音播放中 · 跟随 B 站播放进度")
 
-    def _voice_end(self, cue):
+    def _finish_tail(self, position, paused, rate, *, natural_end=False):
+        cue = self._clip_cue
+        if (not cue or not self._clip_started or not self._media_ready or self._ended
+                or not self._active or not self._lease):
+            return False
+        following = self._next_start(cue)
+        if following <= position or (not natural_end and position < self._voice_end(cue)):
+            return False
+        if self._tail_deadline is None:
+            remaining = self.audio.remaining_seconds()
+            if remaining is None or remaining > self.TAIL_SECONDS:
+                return False
+            self._tail_deadline = self._clock() + self.TAIL_SECONDS
+        if self._clock() >= self._tail_deadline:
+            return False
+        self._renew()
+        if not self._active or not self._lease or not self.enabled:
+            self.audio.pause()
+            return True
+        waiting = bool(self._video.get("buffering") or self._video.get("seeking"))
+        audio_paused = waiting or (paused and not natural_end)
+        self.audio.finish(max(.25, min(4., rate * self._clip_stretch)), audio_paused)
+        self._status("英文配音已暂停" if audio_paused else "英文配音正在读完句尾")
+        return True
+
+    def _next_start(self, cue):
         index = bisect_right(self._timeline._starts, cue["start"])
-        following = self._timeline._starts[index] if index < len(self._timeline._starts) else math.inf
-        return min(cue["end"], following)
+        return self._timeline._starts[index] if index < len(self._timeline._starts) else math.inf
+
+    def _voice_end(self, cue):
+        return min(cue["end"], self._next_start(cue))
 
     def _prepare_ahead(self, current, position):
         cues = self._timeline.cues
@@ -439,7 +511,7 @@ class DubbingSession(QObject):
             self._active = True
             self._last_ack = self._clock()
             serial = event.get("seek_serial", 0)
-            if (event.get("paused") or event.get("seeking") or event.get("buffering")
+            if ((event.get("paused") and not event.get("ended")) or event.get("seeking") or event.get("buffering")
                     or (self._seek_serial is not None and serial > self._seek_serial)):
                 self._ack_guard = dict(stamp=self._clock(), serial=serial)
                 self.audio.pause()
@@ -498,6 +570,8 @@ class DubbingSession(QObject):
     def _media_ended(self, event):
         if event.get("token") == self._media_token and self._media_token:
             self._ended = True
+            if self._video and self._video.get("ended"):
+                self._release()
 
     def _watch(self):
         now = self._clock()

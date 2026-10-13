@@ -105,7 +105,8 @@ def normalize_video(raw: dict) -> dict:
     video = {"key": key, "platform": platform, "video_id": video_id, "id": video_id,
              "url": canonical, "page": page, "cid": cid, "title": str(raw.get("title", ""))[:600],
              "position": finite("position", 0, 0, 604800), "duration": finite("duration", 0, 0, 604800),
-             "paused": bool(raw.get("paused", True)), "rate": finite("rate", 1, .1, 16),
+             "paused": bool(raw.get("paused", True)), "ended": raw.get("ended") is True,
+             "rate": finite("rate", 1, .1, 16),
              "active": bool(raw.get("active", False)), "ad_playing": bool(raw.get("ad_playing", False)),
              "is_live": bool(raw.get("is_live", False)),
              "seeking": bool(raw.get("seeking", False)), "buffering": bool(raw.get("buffering", False)),
@@ -531,7 +532,8 @@ class BrowserBridge(QObject):
             for name, default, low, high in (("position", 0, 0, 604800), ("rate", 1, .1, 16)):
                 value = float(body.get(name, default))
                 event[name] = max(low, min(high, value)) if math.isfinite(value) else default
-            event.update(paused=bool(body.get("paused", True)), seeking=bool(body.get("seeking", False)),
+            event.update(paused=bool(body.get("paused", True)), ended=body.get("ended") is True,
+                         seeking=bool(body.get("seeking", False)),
                          buffering=bool(body.get("buffering", False)))
             serial = body.get("seek_serial", 0)
             event["seek_serial"] = min(2147483647, serial) if type(serial) is int and serial >= 0 else 0
