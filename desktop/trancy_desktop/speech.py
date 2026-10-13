@@ -35,7 +35,8 @@ _MESSAGES = {
     "queue_full": "本地配音准备队列已满，请稍后重试",
     "no_english_voice": "Windows 没有可用的本地英语语音，请安装英语语音包",
     "voice_unavailable": "所选 Windows 本地英语音色不可用",
-    "engine_unavailable": "无法启动 Windows 本地英语语音引擎",
+    "engine_unavailable": "无法启动本地英语语音引擎",
+    "kokoro_unavailable": "Kokoro 本地模型或运行环境未就绪，请运行 setup-kokoro.ps1",
     "worker_exited": "Windows 本地英语语音引擎意外退出",
     "worker_protocol": "本地英语语音引擎返回无效数据",
     "render_failed": "本地英语配音生成失败",
@@ -159,8 +160,8 @@ class _SpeechProcess(QThread):
                         pass
 
 
-def speech_cache_key(text: str, voice: str = DEFAULT_VOICE, rate: int = 0) -> str:
-    payload = json.dumps([ENGINE_VERSION, text, voice, rate], ensure_ascii=False,
+def speech_cache_key(text: str, voice: str = DEFAULT_VOICE, rate: int = 0, *, engine=ENGINE_VERSION) -> str:
+    payload = json.dumps([engine, text, voice, rate], ensure_ascii=False,
                          separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
 
@@ -183,6 +184,7 @@ def wave_info(path: str | Path) -> dict:
 
 
 class LocalSpeech(QObject):
+    engine_version = ENGINE_VERSION
     ready = pyqtSignal(dict)
     failed = pyqtSignal(dict)
     closed = pyqtSignal()
@@ -252,7 +254,7 @@ class LocalSpeech(QObject):
             self.failed.emit(dict(token=token, generation=generation, code="queue_full",
                                   message=_MESSAGES["queue_full"]))
             return False
-        key = speech_cache_key(text, voice, rate)
+        key = speech_cache_key(text, voice, rate, engine=self.engine_version)
         task = dict(text=text, token=token, generation=generation, voice=voice, rate=rate,
                     key=key, request_id=uuid.uuid4().hex, accepted_at=time.monotonic())
         self._queue.append(task)
@@ -339,8 +341,9 @@ class LocalSpeech(QObject):
     def _launch(self):
         try:
             program, arguments = self.backend.command(self.cache_dir)
-        except (OSError, TypeError, ValueError):
-            self._fail_all("engine_unavailable")
+        except (OSError, TypeError, ValueError) as error:
+            code = getattr(error, "code", "engine_unavailable")
+            self._fail_all(code if code in _MESSAGES else "engine_unavailable")
             return
         process = _SpeechProcess(str(program), [str(value) for value in arguments], self.cache_dir, self)
         self.process = process
@@ -408,7 +411,7 @@ class LocalSpeech(QObject):
             else:
                 output.rename(final)
             final.with_suffix(".json").write_text(json.dumps(
-                dict(engine=ENGINE_VERSION, voice=voice, rate=task["rate"], **info),
+                dict(engine=self.engine_version, voice=voice, rate=task["rate"], **info),
                 ensure_ascii=False, indent=2) + "\n", encoding="utf-8", newline="\n")
         except OSError:
             self._fail_active("cache_error")
@@ -422,7 +425,7 @@ class LocalSpeech(QObject):
     def _emit_ready(self, task, **info):
         if not self._closing and task["generation"] == self._generation:
             self.ready.emit(dict(token=task["token"], generation=task["generation"],
-                                 rate=task["rate"], engine=ENGINE_VERSION,
+                                 rate=task["rate"], engine=self.engine_version,
                                  elapsed_ms=round((time.monotonic() - task["accepted_at"]) * 1000), **info))
 
     def _emit_failed(self, task, code):

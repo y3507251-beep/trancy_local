@@ -29,6 +29,8 @@ def spin_until(predicate, timeout=5):
 
 FAKE_WORKER = r'''
 import json, os, struct, sys, time, wave
+if len(sys.argv) > 1:
+    with open(sys.argv[1], 'w') as stream: stream.write(str(os.getpid()))
 for line in sys.stdin:
     request = json.loads(line)
     if request['command'] == 'shutdown': break
@@ -54,10 +56,14 @@ class FakeBackend:
     def __init__(self, script):
         self.script = script
         self.launches = 0
+        self.pid_file = None
 
     def command(self, cache_dir):
         self.launches += 1
-        return sys.executable, ["-B", "-u", str(self.script)]
+        arguments = ["-B", "-u", str(self.script)]
+        if self.pid_file:
+            arguments.append(str(self.pid_file))
+        return getattr(sys, "_base_executable", sys.executable), arguments
 
 
 class LocalSpeechTests(unittest.TestCase):
@@ -189,6 +195,32 @@ class LocalSpeechTests(unittest.TestCase):
         self.assertEqual(self.closed, [True])
         self.assertFalse(self.ready)
         self.assertFalse(self.failed)
+
+    @unittest.skipUnless(os.name == "nt", "Windows venv redirector lifecycle")
+    def test_reset_terminates_the_actual_worker_process_without_blocking_the_ui(self):
+        import ctypes
+        from ctypes import wintypes
+        pid_file = self.root / "worker-pid.txt"
+        self.backend.pid_file = pid_file
+        self.session.request("delay", "active", 0)
+        self.assertTrue(spin_until(pid_file.is_file))
+        pid = int(pid_file.read_text())
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel.OpenProcess.restype = wintypes.HANDLE
+        kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        handle = kernel.OpenProcess(0x100000, False, pid)
+        self.assertTrue(handle)
+        try:
+            self.assertEqual(kernel.WaitForSingleObject(handle, 0), 258)
+            before = time.monotonic()
+            self.session.reset(1)
+            self.assertLess(time.monotonic() - before, .1)
+            self.assertTrue(spin_until(lambda: kernel.WaitForSingleObject(handle, 0) == 0, 2))
+            self.assertFalse(self.ready)
+        finally:
+            kernel.CloseHandle(handle)
 
     def test_engine_start_failure_is_fixed_and_queue_is_drained(self):
         self.backend.command = lambda cache: (str(self.root / "missing.exe"), [])

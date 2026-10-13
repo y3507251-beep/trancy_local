@@ -156,8 +156,9 @@ class FakeDubbing(QObject):
     disabled = pyqtSignal(str)
     closed = pyqtSignal()
 
-    def __init__(self, bridge, parent=None):
+    def __init__(self, bridge, parent=None, *, voice="af_heart"):
         super().__init__(parent)
+        self.voice = voice
         self.enabled = False
         self.is_closed = False
         self.sources, self.corpus, self.ticks = [], [], []
@@ -165,6 +166,7 @@ class FakeDubbing(QObject):
         self.shutdown_called = False
 
     def set_enabled(self, value): self.enabled = value
+    def set_voice(self, value): self.voice = value
     def set_source(self, generation, video): self.sources.append((generation, video))
     def set_cues(self, generation, cues): self.corpus.append((generation, list(cues)))
     def tick(self, *args): self.ticks.append(args)
@@ -531,6 +533,27 @@ class ControllerTests(unittest.TestCase):
         w._tick()
         self.assertIsNone(w._dubbing)
         self.assertEqual(w.asr.requests, [])
+
+    def test_male_and_female_voice_selection_is_saved_without_enabling_dubbing(self):
+        w = self.window
+        self.assertEqual([w.dubbing_voice.itemData(i) for i in range(w.dubbing_voice.count())],
+                         ["af_heart", "am_michael"])
+        self.assertEqual(w.dubbing_voice.currentData(), "af_heart")
+        w.dubbing_voice.setCurrentIndex(1)
+        self.assertEqual(w.settings.get("dubbing_voice"), "am_michael")
+        self.assertIsNone(w._dubbing)
+        self.assertFalse(w.english_dubbing.isChecked())
+
+    def test_selected_voice_is_used_at_startup_and_switches_while_enabled(self):
+        from trancy_desktop import dubbing
+        w = self.window
+        w.dubbing_voice.setCurrentIndex(1)
+        with patch.object(dubbing, "DubbingSession", FakeDubbing):
+            w.english_dubbing.setChecked(True)
+        self.assertEqual(w._dubbing.voice, "am_michael")
+        w.dubbing_voice.setCurrentIndex(0)
+        self.assertEqual(w._dubbing.voice, "af_heart")
+        self.assertTrue(w._dubbing.enabled)
 
     def test_dubbing_checkbox_creates_backend_only_after_opt_in_and_shares_captions(self):
         from trancy_desktop import dubbing

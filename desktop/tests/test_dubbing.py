@@ -29,9 +29,11 @@ class FakeSpeech(QObject):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.requests, self.resets = [], []
+        self.voices = []
         self.is_closed = False
 
-    def request(self, text, token, generation):
+    def request(self, text, token, generation, *, voice=None):
+        self.voices.append(voice)
         self.requests.append((text, token, generation))
         return True
 
@@ -160,6 +162,35 @@ class DubbingSessionTests(unittest.TestCase):
         self.assertEqual(self.session.speech.requests, [])
         self.assertEqual(self.bridge.requests, [])
         self.assertEqual(self.session.audio.loads, [])
+
+    def test_voice_switch_retires_audio_cache_and_old_generation_callbacks(self):
+        self.start()
+        self.assertEqual(self.session.speech.voices[0], "af_heart")
+        old = self.session.speech.requests[0]
+        old_media = self.session._media_token
+        self.session.set_voice("am_michael")
+        self.assertTrue(self.session.enabled)
+        self.assertFalse(self.bridge.requests[-1]["enabled"])
+        self.assertEqual(self.session._cache, {})
+        self.session.speech.ready.emit(dict(token=old[1], generation=old[2], path="old-voice.wav", duration=4))
+        self.session.audio.ended.emit(dict(token=old_media))
+        self.assertEqual(self.session._cache, {})
+        self.tick()
+        self.assertEqual(self.session.speech.voices[-1], "am_michael")
+        self.session.speech.complete(index=1)
+        for _ in range(3):
+            self.tick()
+        self.assertTrue(self.session._clip_started)
+        self.assertNotEqual(self.session._media_token, old_media)
+
+    def test_missing_kokoro_runtime_disables_without_muting_the_video(self):
+        self.session.set_enabled(True)
+        self.tick()
+        request = self.session.speech.requests[0]
+        self.session.speech.failed.emit(dict(token=request[1], generation=request[2],
+            code="kokoro_unavailable", message="模型未安装"))
+        self.assertFalse(self.session.enabled)
+        self.assertEqual(self.bridge.requests, [])
 
     def test_prepared_wave_and_loaded_media_and_mute_ack_are_all_required(self):
         self.session.set_enabled(True)
