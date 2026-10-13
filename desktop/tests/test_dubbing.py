@@ -350,10 +350,40 @@ class DubbingSessionTests(unittest.TestCase):
         self.assertEqual(len(self.session.audio.alignments), count)
         self.assertEqual(self.session.audio.finishes, [(1, False)])
 
-    def test_short_speech_still_follows_the_video_playback_rate(self):
-        self.start(duration=2)
+    def test_short_speech_stays_natural_when_it_already_fits_fast_video(self):
+        self.start(duration=.5)
         self.tick(rate=2)
-        self.assertEqual(self.session.audio.alignments[-1][:3], (0, 2, False))
+        self.assertEqual(self.session.audio.alignments[-1][:3], (0, 1, False))
+
+    def test_slow_web_video_does_not_stretch_short_speech(self):
+        self.start(duration=2)
+        for rate in (.5, .75):
+            self.tick(rate=rate)
+            self.assertEqual(self.session.audio.alignments[-1][1], 1)
+
+    def test_fast_sentence_reserves_two_tenths_of_actual_wall_time(self):
+        self.start(duration=8)
+        self.tick(rate=1.5)
+        speed = self.session.audio.alignments[-1][1]
+        # Three video seconds at 1.5x are two real seconds. The speech gets
+        # 1.8 real seconds, not a margin shortened again by the website rate.
+        self.assertAlmostEqual(8 / speed, 3 / 1.5 - .2)
+
+    def test_enabling_near_sentence_end_defers_without_muting_or_extreme_speed(self):
+        following = dict(CUE, start=5, end=9, translation="The following sentence")
+        self.session.set_cues(1, [CUE, following])
+        self.session.set_enabled(True)
+        self.tick(position=4.9)
+        self.session.speech.complete(duration=4)
+        self.session.speech.complete(index=1, duration=2)
+        self.tick(position=4.9)
+        self.assertEqual(self.session.audio.alignments, [])
+        self.assertEqual(self.bridge.requests, [])
+        self.assertTrue(self.session.audio.preloads)
+        self.now = .1
+        for _ in range(3):
+            self.tick(position=5)
+        self.assertEqual(self.session.audio.alignments[-1][:3], (0, 1, False))
 
     def test_actual_audio_lag_increases_speed_without_skipping_words(self):
         self.start(duration=8)

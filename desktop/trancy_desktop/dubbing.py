@@ -302,6 +302,7 @@ class DubbingSession(QObject):
         self._clip_rate = None
         self._clip_paused = False
         self._clip_output_started = False
+        self._clip_skipped = False
         self._clip_video_origin = self._clip_audio_origin = 0.
         self._tail_deadline = None
         self._frame = None
@@ -390,6 +391,7 @@ class DubbingSession(QObject):
         self._clip_rate = None
         self._clip_paused = False
         self._clip_output_started = False
+        self._clip_skipped = False
         self._clip_video_origin = self._clip_audio_origin = 0.
         self._tail_deadline = None
 
@@ -490,6 +492,21 @@ class DubbingSession(QObject):
             self.audio.pause()
             self._status("等待可用英文字幕 · 当前播放原声")
             return
+        # Enabling dubbing near a sentence's end must not squeeze its complete
+        # audio into the last few milliseconds at an unintelligible rate.
+        # An explicit user seek can still begin at its intended word position.
+        if (not self._clip_started and self._clip_seek_position is None and
+                (self._voice_end(cue) - position) / rate <= self.FIT_MARGIN_SECONDS):
+            if not self._clip_skipped:
+                LOG.info("dubbing_deferred remaining_window=%.3f video_rate=%.3f",
+                         (self._voice_end(cue) - position) / rate, rate)
+            self._clip_skipped = True
+        if self._clip_skipped:
+            self.audio.pause()
+            self._release()
+            self._preload_following(position, allow_unready=True)
+            self._status("本句已接近结束 · 从下一句开始完整配音，当前播放原声")
+            return
         sample = self._cache.get(token)
         if sample is None:
             self._release()
@@ -536,9 +553,11 @@ class DubbingSession(QObject):
             # position notifications never chase the deadline by repeatedly
             # rebuilding Qt's pitch-compensating time stretcher.
             available = max(.001, (self._voice_end(cue) - position) / rate)
-            reserve = min(self.FIT_MARGIN_SECONDS, available * .1)
+            reserve = min(self.FIT_MARGIN_SECONDS, available * .25)
             needed = max(0., sample["duration"] - audio_seconds) / max(.001, available - reserve)
-            playback_rate = max(.25, rate, needed)
+            # Natural speech is the lower bound, even if the website plays
+            # slowly. Short sentences finish naturally and leave a pause.
+            playback_rate = max(1., needed)
             if output_started and not rate_changed and not resumed:
                 previous_rate = rate * self._clip_stretch
                 if playback_rate <= previous_rate * 1.05:
@@ -549,7 +568,7 @@ class DubbingSession(QObject):
                      "start" if not self._clip_started else "rate" if rate_changed else
                      "resume" if resumed else "audio_started")
         else:
-            playback_rate = max(.25, rate * self._clip_stretch)
+            playback_rate = max(1., rate * self._clip_stretch)
         if output_started:
             self._clip_output_started = True
         self._clip_rate, self._clip_paused = rate, paused
@@ -567,8 +586,9 @@ class DubbingSession(QObject):
         self._preload_following(position)
         self._status("英文配音已暂停" if paused else "英文配音播放中 · 跟随 B 站播放进度")
 
-    def _preload_following(self, position):
-        if not self.enabled or not self._media_ready or not hasattr(self.audio, "preload"):
+    def _preload_following(self, position, *, allow_unready=False):
+        if (not self.enabled or (not self._media_ready and not allow_unready)
+                or not hasattr(self.audio, "preload")):
             return
         index = bisect_right(self._timeline._starts, position)
         for cue in self._timeline.cues[index:index + self.PREFETCH]:
@@ -600,7 +620,7 @@ class DubbingSession(QObject):
             return True
         waiting = bool(self._video.get("buffering") or self._video.get("seeking"))
         audio_paused = waiting or (paused and not natural_end)
-        self.audio.finish(max(.25, rate * self._clip_stretch), audio_paused)
+        self.audio.finish(max(1., rate * self._clip_stretch), audio_paused)
         self._status("英文配音已暂停" if audio_paused else "英文配音正在读完句尾")
         return True
 
